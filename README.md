@@ -43,9 +43,10 @@ The Quality Gate splits code review in a way that plays to each tool's strength:
 **The single most important fact: it is 100% read-only.**
 
 - ✅ **Never edits, formats, or fixes your code.** Every tool runs in check-only
-  mode (`ruff check --no-fix`, `prettier --check`, `mypy`, `npm audit`,
-  `gitleaks detect`, …). No `--fix`/`--write` flags anywhere.
-- ✅ **Never changes git state.** No add, commit, push, or checkout.
+  mode (`ruff check --no-fix`, `prettier --list-different`, `mypy`, `pnpm audit`,
+  `gitleaks git`, …). No `--fix`/`--write` flags anywhere. `tsc` runs with
+  `--incremental false` so it can't drop a `.tsbuildinfo` into your repo.
+- ✅ **Never changes git state.** No add, commit, push, checkout, or worktree.
 - ✅ **Never installs anything.** It only runs tools already available.
 - ✅ **Can't break a build.** A missing tool is *skipped*, not failed. Exit code is
   `0` by default; `--strict` (opt-in) is the only way it returns non-zero.
@@ -60,7 +61,8 @@ The Quality Gate splits code review in a way that plays to each tool's strength:
 | **Read-only** | Runs everything in *check* mode. There is **no** `--fix`/`--write` anywhere. |
 | **Auto-detect** | It only runs a tool that's already installed. A missing tool becomes `SKIP`, never an error. A repo with no Python tools simply shows every Python row as `SKIP`. |
 | **Scoped by default** | With no flags it scans **only the files that changed** vs your base branch (`origin/main`, `main`, …) — you see issues in *new* code, not a wall of legacy noise ("clean as you code"). |
-| **AI is diff-based** | The Claude review only runs on a diff. `--all` disables AI on purpose (reviewing a whole repo would be noisy and expensive). |
+| **New vs pre-existing** | Inside those files, every finding is classified: on a line **you changed** = *new* (counts); anywhere else = *pre-existing* (listed as info, never blamed on you). |
+| **AI is diff-based** | The Claude review only runs on a diff — split into per-file parts so even a 600-file branch gets reviewed. `--all` disables AI on purpose. |
 
 > The everyday use case: run it with **no flags** on a repo you're actively working
 > in, right before you commit or open a PR. You get a short list of issues **in the
@@ -78,12 +80,24 @@ The Quality Gate splits code review in a way that plays to each tool's strength:
 | Security (Python) | `bandit` | read-only | changed files |
 | Dependencies (Python) | `pip-audit` | read-only | project |
 | Lint (JS/TS) | `eslint` | read-only | changed files |
-| Format (JS/TS) | `prettier --check` | read-only | changed files |
-| Types (JS/TS) | `tsc --noEmit` | read-only | project |
-| Dependencies (JS/TS) | `npm audit` | read-only | project |
-| Secrets | `gitleaks detect` | read-only | working tree |
-| Supabase (RLS/keys/grants) | *built-in* (no tool) | read-only | changed code + `.sql` |
-| AI review | `claude -p` | read-only | the diff |
+| Format (JS/TS) | `prettier --list-different` | read-only, advisory unless enforced | changed files |
+| Types (JS/TS) | `tsc --noEmit` | read-only | project, errors split by changed files |
+| Dependencies (JS/TS) | `pnpm` / `yarn` / `bun` / `npm audit` (picked from the lockfile) | read-only | project |
+| Secrets | `gitleaks git` | read-only | **your branch's commits** + working tree (`--all`: full history) |
+| Supabase (RLS/keys/grants) | *built-in* (no tool) | read-only | changed code + `.sql` (RLS state read from all migrations) |
+| AI review | `claude -p` | read-only | the diff, in per-file parts |
+
+**Built to be trusted on big branches:**
+
+- **Tool crashes are `ERROR`, never `FINDINGS`.** "Command line is too long",
+  Node out-of-memory, ESLint/Prettier exit code 2, a missing config, or an audit
+  that couldn't run are reported as the tool failing — with the reason.
+- **Long file lists are batched** to stay under the Windows `cmd.exe` 8,191-char
+  limit (a 700-file branch runs ESLint in ~11 batches and merges the results).
+- **JS tools get a bigger heap** (`node_max_old_space_mb`, default 8192) so `tsc`
+  on a large Next.js app doesn't die at Node's 2 GB default.
+- **Only files git tracks are scanned** — `.next/`, `.env.local`, build output and
+  other ignored files never show up.
 
 Deterministic tools own anything mechanical. The AI review is reserved for
 judgment — security, business logic, architecture, performance, maintainability —
@@ -193,6 +207,9 @@ node scan.js --path E:\path\to\my-project
 | Fast check, no AI (offline, just linters) | `qg --no-ai` |
 | Deep review before a big PR (all 6 AI reviewers) | `qg --ai-full` |
 | Check only what's staged (pre-commit) | `qg --staged` |
+| **Whole feature branch vs master** (all its commits) | `git fetch origin` then `qg --base origin/master` |
+| Same, one module at a time | `qg --base origin/master --only src/billing` |
+| Also count issues that were already there | `qg --base origin/master --include-existing` |
 | Review everything since a release/tag | `qg --base v1.4.0` |
 | Scan a **different** repo, zero-touch | `qg --path ../other-repo` |
 | One-time full audit of a legacy repo (no AI) | `qg --path ../repo --all --no-ai` |
@@ -210,28 +227,54 @@ node scan.js --path E:\path\to\my-project
 ## 5. Options / flags
 
 ```
---path PATH     repo to scan (default: current directory)
---all           scan the whole project instead of just changes (disables AI)
---staged        scan only git-staged changes
---base REF      git base ref for the diff (default: auto-detect origin/main…)
---no-ai         skip the AI review
---ai-full       run all 6 specialized AI reviewers (review/security/architecture/
-                performance/business-logic/supabase)
---no-report     print to the console only; write no files anywhere
---out DIR       report output directory (default: ./quality-reports)
---strict        exit 1 if any findings (for optional CI gating)
---timeout SEC   per-tool timeout (default: 600)
+--path PATH          repo to scan (default: current directory)
+--all                scan the whole project instead of just changes (disables AI)
+--staged             scan only git-staged changes
+--base REF           git base ref for the diff (default: auto-detect origin/HEAD,
+                     origin/main, origin/master…)
+--only PATH          limit the scan (files, findings, diff) to a path; repeatable
+--include-existing   count findings on lines you did NOT change as well
+--no-ai              skip the AI review
+--ai-full            run all 6 specialized AI reviewers (review/security/architecture/
+                     performance/business-logic/supabase)
+--ai-max-chunks N    max diff parts per AI reviewer (default 10; each = 1 claude call)
+--no-report          print to the console only; write no files anywhere
+--out DIR            report output directory (default: ./quality-reports)
+--strict             exit 1 if any NEW findings (for optional CI gating)
+--timeout SEC        per-tool timeout (default: 600)
 ```
 
 **How scope is decided:**
 - In a git repo it scans **changed files vs the base branch** by default
-  (auto-detects `origin/main`, `main`, …). This keeps reports focused and is why
-  it's safe on large codebases — you see issues in *new* code, not legacy noise.
-- `--all` scans everything; `--staged` scans staged changes only.
+  (auto-detects `origin/HEAD` → `origin/main` → `origin/master` → `main` →
+  `master`). The diff is taken from the **fork point** (`git merge-base`) to your
+  working tree, so it covers every commit on the branch plus uncommitted and
+  untracked work — and ignores commits that landed on master after you branched.
+- `--all` scans everything git tracks; `--staged` scans staged changes only.
 - Not a git repo? It automatically falls back to `--all`.
 
+**How "new" is decided (the baseline):**
+- Line-level tools (ESLint, Ruff, Bandit, Supabase, Prettier): a finding is
+  **new** if it sits on a line you added/changed. Moved-but-unchanged files are
+  pre-existing.
+- Cross-file tools (`tsc`, `mypy`): **new** if it's in a file you changed. Errors
+  in untouched files are listed separately — usually pre-existing, but a changed
+  signature can break an untouched caller, so they're shown, not hidden.
+- Dependency audit: **new** only if the lockfile or a `package.json` dependency
+  field changed; otherwise every advisory already exists on the base branch.
+- Secrets (gitleaks): only the branch's commits and your working tree are scanned,
+  so everything it reports was introduced by the change.
+- `--include-existing` turns all of this off and counts everything.
+
+**Big branches & the AI review:** the diff is split per file into ~60k-char parts
+(source code first, lockfiles/minified/binary left out) and each part is reviewed
+separately. With the default cap of 10 parts, a very large branch may be only
+partly reviewed — the report's **coverage** entry lists every file that wasn't, so
+raise `--ai-max-chunks` or review module by module with `--only`.
+
 **Exit codes:** `0` = ran fine (even with findings). `1` = only with `--strict`
-*and* there were findings. `2` = bad `--path`. That's why it's safe in CI by
+*and* there were new findings. `2` = bad `--path` or a `--base` ref that doesn't
+exist (`git fetch origin` usually fixes it). That's why it's safe in CI by
 default — it can't fail your build unless you opt in with `--strict`.
 
 ---
@@ -250,13 +293,17 @@ Each check has a status:
 | Status | Meaning | What to do |
 |---|---|---|
 | **PASS** | Tool ran, found nothing | 🎉 Nothing to do |
-| **FINDINGS** | Tool ran, found issues | Read the **Details** section and fix them |
+| **FINDINGS** | Tool ran, found issues **your change introduced** | Read the **Details** section and fix them |
+| **INFO** | Only pre-existing issues, warnings, low-severity notes, or an advisory check (e.g. an unenforced formatter) | Nothing blocks; worth a look when you touch that code |
 | **SKIP** | Tool not installed, or nothing in scope | Install the tool (§3) if you want that check |
-| **ERROR** | Tool crashed or timed out | See §10 — usually a missing lockfile or a real timeout |
+| **ERROR** | The *tool* failed (crash, OOM, timeout, missing config/lockfile) — not your code | See §10 |
 | **OFF** | Disabled in config | You turned it off in `quality-gate.config.json` |
 
-- The **Details** section lists only `FINDINGS` and `ERROR` checks, each with the
-  *exact command it ran* and the raw output — so you can reproduce it yourself.
+- The **Details** section lists `FINDINGS` and `ERROR` checks, each with the
+  command it ran. Findings are grouped as **New in this change** and
+  **Pre-existing**. `INFO` checks sit in a collapsed section below.
+- Skipped checks are folded into one line (e.g. the Python tools on a JS repo).
+- Secrets are **never printed** — only rule, file, line, commit and the length.
 - The **AI Review** section is Claude's prose analysis of your diff: each issue gets
   a `file:line` estimate, a severity (high/med/low), the problem in one sentence,
   and a concrete fix. If it found nothing, it says so.
@@ -282,7 +329,11 @@ Lives next to `scan.js`. Delete it and safe defaults still apply.
 ```json
 {
   "base_ref": null,
-  "disabled_checks": []
+  "disabled_checks": [],
+  "node_max_old_space_mb": 8192,
+  "format_checks": "auto",
+  "ai_max_chunks": 10,
+  "ai_chunk_chars": 60000
 }
 ```
 
@@ -292,7 +343,16 @@ Lives next to `scan.js`. Delete it and safe defaults still apply.
 - **`disabled_checks`** — check ids you never want to run. Valid ids: `ruff`,
   `ruff-format`, `mypy`, `bandit`, `pip-audit`, `eslint`, `prettier`, `tsc`,
   `npm-audit`, `gitleaks`, `supabase`. Example — silence npm audit and secrets:
-  `["npm-audit", "gitleaks"]`.
+  `["npm-audit", "gitleaks"]`. (`npm-audit` is the id for the JS dependency audit
+  whichever package manager runs it.)
+- **`node_max_old_space_mb`** — heap given to eslint/prettier/tsc (via
+  `NODE_OPTIONS`). Raise it if `tsc` reports "Node ran out of memory".
+- **`format_checks`** — `"auto"` (default): Prettier/ruff-format are findings
+  only if the project *enforces* them (lint-staged, a husky/lefthook/pre-commit
+  hook, a CI workflow, or `eslint-plugin-prettier`); otherwise advisory `INFO`.
+  `"enforce"` / `"advisory"` force one or the other.
+- **`ai_max_chunks`** / **`ai_chunk_chars`** — how many diff parts (and how large)
+  each AI reviewer gets.
 
 ### Give Claude your project's rules — `CLAUDE.md`
 
@@ -334,12 +394,29 @@ over changed code + `.sql` migrations:
 | It flags | Severity | Why |
 |---|---|---|
 | `service_role`/secret key behind a browser-exposed env var (`NEXT_PUBLIC_`, `VITE_`, `REACT_APP_`, …) | HIGH | Ships full-DB-access credentials to the client |
-| A hardcoded secret key (`sb_secret_…`) or a `service_role` JWT in source | HIGH | Leaks a key that bypasses RLS |
+| A hardcoded secret key (`sb_secret_…`) | HIGH | Leaks a key that bypasses RLS |
+| A hardcoded JWT whose payload says `"role": "service_role"` (decoded — the variable name doesn't matter; project ref + expiry shown) | HIGH | Leaks a key that bypasses RLS |
 | `service_role` referenced in a client (`'use client'`) file | HIGH | The service role must never reach the browser |
-| `... disable row level security` in a migration | HIGH | Table becomes fully readable/writable with the anon key |
-| `create table …` with no `enable row level security` in the same file | MEDIUM | New table left unprotected |
-| `grant … to anon`/`public` (write = MEDIUM, read = LOW) | MED/LOW | Exposes data via the REST API; prefer RLS policies |
-| `service_role` referenced inside a `create policy` | MEDIUM | Likely a misconfiguration — service_role already bypasses RLS |
+| `alter table … disable row level security` | HIGH | Table becomes fully readable/writable with the anon key |
+| `create table` in the **public** schema that **no migration** ever enables RLS on | MEDIUM | New table left unprotected |
+| `grant <write> … to anon`/`public` | MEDIUM | Exposes data via the REST API; prefer RLS policies |
+| `grant <read>/execute … to anon`/`public` | LOW | Readable / RPC-callable by anyone — make sure RLS or the function checks auth |
+| A policy whose `TO` clause (or `USING`) targets `service_role` | LOW | Redundant (service_role already bypasses RLS) — harmless, safe to drop |
+
+**How it avoids false positives:**
+- **Comments are stripped** before the semantic rules run — `-- service_role
+  only`, `/* … disable row level security … */` or `// uses service_role` in a
+  comment never fire. (Secret rules still read raw text: a key pasted in a
+  comment is still a leaked key.)
+- **SQL is matched per statement**, not per line, so multi-line `create policy`
+  / `grant` statements are parsed whole. `GRANT EXECUTE … TO service_role` is not
+  a policy and is never flagged.
+- **RLS state is collected across every `.sql` file in the repo**, so a table
+  created in one migration and protected in a later one is fine.
+- Tables in non-public schemas (e.g. `private.audit`) aren't exposed by the REST
+  API and aren't flagged. `grant usage on schema … to anon` (a Supabase default)
+  is ignored.
+- Placeholders (`sb_secret_xxxx…`, `YOUR_…`, `<…>`, `${…}`, `...`) are ignored.
 
 > The anon key hardcoded in client code is **not** flagged — it's designed to be
 > public. RLS, not key secrecy, is what protects your data.
@@ -476,12 +553,21 @@ enforcement that can't be skipped.
 |---|---|---|
 | **Everything Python shows `SKIP`** | Those tools aren't installed / not on PATH | `pip install ruff mypy bandit pip-audit` |
 | **A JS tool shows `SKIP`** even though installed globally | JS tools must be **local** to the project | `npm install -D eslint prettier typescript` inside the project |
-| **`npm audit` → ERROR `ENOLOCK`** | No `package-lock.json` | `npm i --package-lock-only` once, or disable `npm-audit` in config |
+| **Dependency audit → SKIP "no lockfile found"** | The repo has `package.json` but no `pnpm-lock.yaml` / `yarn.lock` / `bun.lock` / `package-lock.json` | Commit the lockfile your package manager makes |
+| **Dependency audit → SKIP "pnpm not found on PATH"** | The lockfile is pnpm's but `pnpm` isn't installed globally | `npm i -g pnpm` (or `corepack enable`) |
+| **Dependency audit → ERROR "audit could not run"** | Registry unreachable, or the package manager refused the lockfile | Check network/registry; the message shows the package manager's error |
+| **Dependency audit → INFO "dependencies unchanged"** | Advisories exist but your change didn't touch deps — they're on base too | Fix them separately (or `--include-existing` to count them) |
+| **`tsc` → ERROR "Node ran out of memory"** | Project too big for the heap | Raise `node_max_old_space_mb` in the config (default 8192) |
+| **ESLint/Prettier → ERROR "command line too long"** | Shouldn't happen any more (lists are batched) | Report it; meanwhile narrow with `--only` |
+| **ESLint → SKIP "no ESLint config"** | The project has ESLint installed but no config file | Add an `eslint.config.*`, or ignore |
+| **Prettier shows INFO "advisory: not enforced"** | Nothing in the project runs Prettier (no hook/CI/lint-staged) | Team decision: enforce it (then it becomes a finding) or drop it; `format_checks` in config overrides |
+| **AI review "coverage – PARTIAL"** | The branch was bigger than `ai_max_chunks` parts | `--ai-max-chunks 30`, or review module by module with `--only` |
+| **`error: base ref not found`** | The `--base` ref doesn't exist locally | `git fetch origin`, then retry |
 | **`tsc` says "Could not find a declaration file for 'pg'"** | Real project gap, not a scanner bug | `npm i -D @types/pg` (the gate faithfully reports your `tsc` output) |
 | **AI review says "skipped"** | `claude` not on PATH, **or** you used `--all`, **or** the diff is empty | Install Claude Code; drop `--all` (AI is diff-based) |
 | **"not a git repository — scanning the whole project"** | You're outside a git repo | Expected; it falls back to `--all` automatically |
 | **A tool timed out (`ERROR`)** | Very large repo | Raise it: `qg --timeout 1200` |
-| **First run floods me with issues** | You used `--all` on a legacy repo | Drop `--all` — the default scans only *your* changes |
+| **First run floods me with issues** | You used `--all` (or `--include-existing`) on a legacy repo | Drop it — the default reports only what *your* change introduced |
 | **Report didn't appear** | You used `--no-report`, or the out dir wasn't writable | Remove `--no-report`, or set `--out` to a writable folder |
 
 ---
@@ -494,6 +580,9 @@ qg                          # scan my changes + AI review  ← use this most
 qg --no-ai                  # faster, offline, just linters/types/security
 qg --ai-full                # deep 6-reviewer AI pass before an important PR
 qg --staged                 # only staged changes (pre-commit)
+qg --base origin/master     # a whole feature branch (all commits) vs master
+qg --base origin/master --only src/billing   # ...one module at a time
+qg --include-existing       # also count issues already on the base branch
 qg --base v1.4.0            # everything since a release
 qg --path ..\repo --all --no-ai   # one-time full audit of another repo
 qg --strict                 # exit 1 on findings (hooks / CI gating)
@@ -511,8 +600,8 @@ winget install gitleaks.gitleaks                # secrets (on PATH)
 # + Claude Code on PATH for AI review
 
 # --- statuses ---
-PASS = clean   FINDINGS = fix these   SKIP = tool missing / nothing in scope
-ERROR = tool crashed/timed out   OFF = disabled in config
+PASS = clean   FINDINGS = new issues, fix these   INFO = pre-existing/advisory
+SKIP = tool missing / nothing in scope   ERROR = the tool failed   OFF = disabled
 
 # --- automate ---
 # Level 1: pre-commit  → advisory (QG_BLOCK=1 to block)
@@ -549,6 +638,11 @@ ones — the tool still scans Python projects by shelling out to `ruff`/`mypy`/
 - ✅ GitHub Actions CI workflow — non-blocking, uploads artifact, **posts the report
   as a PR comment** and updates it on re-runs.
 - ✅ Markdown + JSON + timestamped reports.
+- ✅ Accuracy pass (validated against a 600-file CRM branch): new-vs-pre-existing
+  baseline, tool-crash detection, Windows command-line batching, lockfile-aware
+  dependency audit, branch-scoped gitleaks, statement-level Supabase rules,
+  enforcement-aware format checks, chunked AI review, `--only`.
+  *`scan.py` (the fallback) does not have these — use `scan.js`.*
 
 ### Roadmap
 

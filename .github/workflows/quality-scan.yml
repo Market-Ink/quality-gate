@@ -34,9 +34,16 @@ jobs:
       # JS/TS: install the repo's own dev deps so eslint/prettier/tsc are found in
       # node_modules/.bin. Runs only when a lockfile exists; a no-op otherwise.
       - name: Install project dev dependencies (JS/TS)
-        if: hashFiles('package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock') != ''
+        if: hashFiles('package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml') != ''
         continue-on-error: true   # never fail the build; a failed install just means those checks SKIP
-        run: npm ci
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            corepack enable && yarn install --immutable || yarn install --frozen-lockfile
+          else
+            npm ci
+          fi
 
       # Python: uncomment for repos that use Python tooling.
       # - name: Install Python scanners
@@ -102,17 +109,18 @@ jobs:
               const passed  = checks.filter(c => c.status === 'PASS').length;
               const skipped = checks.filter(c => c.status === 'SKIP' || c.status === 'OFF').length;
               const findings = checks.filter(c => c.status === 'FINDINGS').length;
+              const info     = checks.filter(c => c.status === 'INFO').length;
               const errors   = checks.filter(c => c.status === 'ERROR').length;
 
               const clean = problems.length === 0 && aiProblems.length === 0;
               const verdict = clean
-                ? '✅ **Passed** — no issues found'
+                ? '✅ **Passed** — no new issues in this PR'
                 : findings
-                  ? `⚠️ **Issues found** — ${findings} check(s) with findings`
+                  ? `⚠️ **Issues found** — ${findings} check(s) with new findings`
                   : '❌ **Errors** — one or more checks failed to run';
 
               const counts =
-                `\`${passed} passed\` · \`${findings} findings\` · ` +
+                `\`${passed} passed\` · \`${findings} findings\` · \`${info} info\` · ` +
                 `\`${errors} errors\` · \`${skipped} skipped\``;
 
               const lines = [
