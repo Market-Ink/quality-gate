@@ -1667,6 +1667,61 @@ function fmtK(n) {
   return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n);
 }
 
+// `claude -p --output-format json` returns the review text plus the call's real
+// token usage. Returns null when the output isn't that JSON.
+function parseClaudeJson(stdout) {
+  const s = (stdout || "").trim();
+  const candidates = [s, s.split(/\r?\n/).reverse().find((l) => l.trim().startsWith("{")) || ""];
+  for (const c of candidates) {
+    let d;
+    try {
+      d = JSON.parse(c);
+    } catch {
+      continue;
+    }
+    if (!d || typeof d !== "object" || !("result" in d || "usage" in d)) continue;
+    const u = d.usage || {};
+    return {
+      text: typeof d.result === "string" ? d.result : "",
+      isError: d.is_error === true,
+      usage: {
+        input: u.input_tokens || 0,
+        cache_write: u.cache_creation_input_tokens || 0,
+        cache_read: u.cache_read_input_tokens || 0,
+        output: u.output_tokens || 0,
+        cost_usd: typeof d.total_cost_usd === "number" ? d.total_cost_usd : null,
+        model: Object.keys(d.modelUsage || {})[0] || null,
+        duration_ms: d.duration_ms || null,
+      },
+    };
+  }
+  return null;
+}
+
+const usageTotal = (u) => u.input + u.cache_write + u.cache_read + u.output;
+
+function usageTotals(reviews) {
+  const t = { calls: 0, measured: 0, input: 0, cache_write: 0, cache_read: 0, output: 0,
+    total: 0, cost_usd: 0, models: [] };
+  for (const rv of reviews) {
+    if (!rv.called) continue;
+    t.calls++;
+    if (!rv.usage) continue;
+    t.measured++;
+    for (const k of ["input", "cache_write", "cache_read", "output"]) t[k] += rv.usage[k];
+    t.cost_usd += rv.usage.cost_usd || 0;
+    if (rv.usage.model && !t.models.includes(rv.usage.model)) t.models.push(rv.usage.model);
+  }
+  t.total = t.input + t.cache_write + t.cache_read + t.output;
+  t.cost_usd = Math.round(t.cost_usd * 10000) / 10000;
+  return t;
+}
+
+function fmtUsage(u) {
+  return `${fmtK(usageTotal(u))} tokens (in ${fmtK(u.input)}, cache write ${fmtK(u.cache_write)}, ` +
+    `cache read ${fmtK(u.cache_read)}, out ${fmtK(u.output)})`;
+}
+
 function aiReview(scannerDir, plan, runAll, timeoutMs, context = "") {
   const claude = globalBin("claude");
   if (!claude) {
@@ -1691,6 +1746,7 @@ function aiReview(scannerDir, plan, runAll, timeoutMs, context = "") {
   const intent = context ? "\n\n" + context + "\n" : "";
 
   const reviews = [];
+  let jsonOut = true;
   // Run Claude in a throwaway directory so it has NOTHING in the target to touch.
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "qg-"));
   try {
@@ -1722,13 +1778,29 @@ function aiReview(scannerDir, plan, runAll, timeoutMs, context = "") {
           "to modify, create, or run anything — only report findings." + part + intent +
           "\n\nHere is the unified diff to review:\n\n```diff\n" +
           plan.chunks[i].text + "\n```\n";
-        const [rc, out] = run([claude, "-p"], tmp, timeoutMs, full);
+        const label = n > 1 ? `${name} (part ${i + 1}/${n})` : name;
+        process.stdout.write(`${C.dim}  claude -${label} ...${C.end}`);
+        let [rc, out, stdout] = run([claude, "-p", ...(jsonOut ? ["--output-format", "json"] : [])],
+          tmp, timeoutMs, full);
+        // Older CLIs without --output-format: fall back to plain text, no usage.
+        if (jsonOut && rc !== 0 && /unknown option|output-format/i.test(out)) {
+          jsonOut = false;
+          [rc, out, stdout] = run([claude, "-p"], tmp, timeoutMs, full);
+        }
+        const parsed = jsonOut && typeof rc === "number" ? parseClaudeJson(stdout) : null;
+        const ok = rc === 0 && !(parsed && parsed.isError);
         reviews.push({
-          prompt: n > 1 ? `${name} (part ${i + 1}/${n})` : name,
-          status: rc === 0 ? "PASS" : "ERROR",
+          prompt: label,
+          status: ok ? "PASS" : "ERROR",
           files: plan.chunks[i].files,
-          output: out || "(no output)",
+          output: (parsed ? parsed.text : out) || out || "(no output)",
+          called: true,
+          usage: parsed ? parsed.usage : null,
         });
+        process.stdout.write(`${C.dim} ${ok ? "done" : "FAILED"}` +
+          (parsed ? `, ${fmtUsage(parsed.usage)}` +
+            (parsed.usage.cost_usd != null ? `, ~$${parsed.usage.cost_usd.toFixed(3)}` : "") : "") +
+          `${C.end}\n`);
       }
     }
   } finally {
@@ -1828,6 +1900,13 @@ function printConsole(meta, checks, reviews) {
       const parts = statuses.length > 1 ? `  ${C.dim}(${statuses.length} parts${bad ? `, ${bad} failed` : ""})${C.end}` : "";
       P(`  ${color}[${st.toLowerCase().padEnd(4)}]${C.end}  claude -${name}${parts}`);
     }
+    const u = meta.ai_usage;
+    if (u && u.measured) {
+      P(`  ${C.dim}usage : ${u.calls} call(s), ${fmtUsage(u)}${C.end}`);
+      P(`  ${C.dim}        ~$${u.cost_usd.toFixed(2)} at API list price - on a Pro/Max/Team/Enterprise ` +
+        `login this counts against plan limits instead${C.end}`);
+      if (u.measured < u.calls) P(`  ${C.dim}        (${u.calls - u.measured} call(s) reported no usage)${C.end}`);
+    }
   }
 
   P("-".repeat(60));
@@ -1912,6 +1991,32 @@ function buildMarkdown(meta, checks, reviews) {
       lines.push(rv.output);
       lines.push("");
     }
+  }
+
+  const u = meta.ai_usage;
+  if (u && u.measured) {
+    lines.push("## AI usage");
+    lines.push("");
+    lines.push(`Measured from \`claude -p --output-format json\`. Cost is the API list-price ` +
+      "equivalent; on a Pro/Max/Team/Enterprise login the calls count against plan usage " +
+      "limits instead.");
+    lines.push("");
+    lines.push("| Call | Input | Cache write | Cache read | Output | Total | ~USD | Time |");
+    lines.push("|---|---:|---:|---:|---:|---:|---:|---:|");
+    for (const rv of reviews.filter((r) => r.called)) {
+      const x = rv.usage;
+      if (!x) {
+        lines.push(`| ${rv.prompt} | - | - | - | - | - | - | - |`);
+        continue;
+      }
+      lines.push(`| ${rv.prompt} | ${x.input} | ${x.cache_write} | ${x.cache_read} | ${x.output} | ` +
+        `${usageTotal(x)} | ${x.cost_usd != null ? x.cost_usd.toFixed(3) : "-"} | ` +
+        `${x.duration_ms ? Math.round(x.duration_ms / 1000) + "s" : "-"} |`);
+    }
+    lines.push(`| **Total (${u.calls} calls)** | ${u.input} | ${u.cache_write} | ${u.cache_read} | ` +
+      `${u.output} | **${u.total}** | **${u.cost_usd.toFixed(2)}** | |`);
+    if (u.models.length) lines.push("", `Model: ${u.models.join(", ")}`);
+    lines.push("");
   }
 
   return lines.join("\n");
@@ -2512,6 +2617,7 @@ function main(argv) {
       ? "new findings only (pre-existing ones listed as info; --include-existing to count them)"
       : "all findings",
     time: stampHuman(now),
+    ai_usage: reviews.some((r) => r.called) ? usageTotals(reviews) : null,
     report_path: null,
   };
 

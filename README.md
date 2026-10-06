@@ -390,6 +390,7 @@ everything):
 | `"ai_context_lines": 1` | 1 unchanged line around each change instead of 3 |
 | `"ai_ignore_whitespace": true` | Drops whitespace-only changes (great after a reformat; keep off for Python/YAML) |
 | `--only src/billing` | Review one module per run |
+| `"ai_chunk_chars": 120000` | Fewer, larger parts. Every `claude -p` call carries a fixed ~25k tokens of Claude Code overhead (~9k cache write + ~16k cache read, ~$0.07 measured), so halving the number of calls saves real usage on big branches |
 | always on | Deleted files send only their name, moved files only the rename, and lockfiles, minified, maps and binaries are left out |
 
 **Exit codes:** `0` = ran fine (even with findings). `1` = only with `--strict`
@@ -424,6 +425,13 @@ Each check has a status:
   **Pre-existing**. `INFO` checks sit in a collapsed section below.
 - Skipped checks are folded into one line (e.g. the Python tools on a JS repo).
 - Secrets are **never printed** — only rule, file, line, commit and the length.
+- **AI usage** — every `claude` call is run with `--output-format json`, and the
+  report has a per-call table (input, cache write, cache read, output, total,
+  time) with totals. The same data is in `latest.json` → `meta.ai_usage` and each
+  review's `usage`, and the console prints it live after each call. The `~USD`
+  column is the API list-price equivalent; on a Pro/Max/Team/Enterprise login the
+  calls count against your plan's usage limits instead. (An older `claude` CLI
+  without `--output-format` falls back to plain text with no usage.)
 - The **AI Review** section is Claude's prose analysis of your diff: each issue gets
   a `file:line` estimate, a severity (high/med/low), the problem in one sentence,
   and a concrete fix. If it found nothing, it says so.
