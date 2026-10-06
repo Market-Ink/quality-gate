@@ -255,7 +255,7 @@ function pathspec(scope) {
 }
 
 function untrackedFiles(target, scope) {
-  if (scope.staged) return [];
+  if (scope.staged || scope.range) return [];
   return git(["ls-files", "--others", "--exclude-standard", ...pathspec(scope)], target)
     .split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
 }
@@ -268,13 +268,26 @@ function existsFile(target, rel) {
   }
 }
 
+const splitLines = (text) => text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+
+// Files touched by the commits in a --range. In final-state mode, files an
+// earlier batch already touched are dropped so each file is reviewed once.
+function rangeFiles(target, scope) {
+  const { from, to, final } = scope.range;
+  let names = splitLines(git(["diff", "--name-only", from, to, ...pathspec(scope)], target));
+  if (final && scope.fromRef && scope.fromRef !== from) {
+    const earlier = new Set(splitLines(
+      git(["diff", "--name-only", scope.fromRef, from, ...pathspec(scope)], target)).map(keyOf));
+    names = names.filter((f) => !earlier.has(keyOf(f)));
+  }
+  return names.filter((f) => existsFile(target, f)).sort();
+}
+
 function changedFiles(target, scope) {
+  if (scope.range) return rangeFiles(target, scope);
   const found = new Set();
   const add = (text) => {
-    for (let line of text.split(/\r?\n/)) {
-      line = line.trim();
-      if (line) found.add(line);
-    }
+    for (const line of splitLines(text)) found.add(line);
   };
   add(git([...diffArgs(scope), "--name-only", ...pathspec(scope)], target));
   for (const f of untrackedFiles(target, scope)) found.add(f);
@@ -875,6 +888,9 @@ function runGitleaks(spec, exe, target, scope, ctx) {
     passes.push(["full git history", gitMode([])]);
   } else if (scope.staged) {
     passes.push(["staged changes", preCommit(true)]);
+  } else if (scope.range) {
+    const { from, to } = scope.range;
+    passes.push([`commits ${from.slice(0, 8)}..${to.slice(0, 8)}`, gitMode([`--log-opts=${from}..${to}`])]);
   } else {
     if (scope.fromRef && scope.fromRef !== "HEAD") {
       passes.push([`commits ${scope.fromRef.slice(0, 8)}..HEAD`, gitMode([`--log-opts=${scope.fromRef}..HEAD`])]);
@@ -1553,19 +1569,61 @@ function runChecks(target, files, scope, disabled, ctx) {
 //  Large diffs are split per file into chunks so the reviewer sees all of a
 //  big branch instead of only its first 60k characters.
 // --------------------------------------------------------------------------- //
-function collectDiff(target, scope) {
-  return git([...diffArgs(scope), "--no-color", "--no-ext-diff",
-    "--src-prefix=a/", "--dst-prefix=b/", ...pathspec(scope)], target).trim();
+// gitignore-style globs: "docs/**", "**/*.snap", "*.md" (no slash = any depth).
+function globMatcher(patterns) {
+  const res = (Array.isArray(patterns) ? patterns : []).map((p) => {
+    const pat = String(p).trim().replace(/^\.?\//, "");
+    if (!pat) return null;
+    let re = "";
+    for (let i = 0; i < pat.length; i++) {
+      const c = pat[i];
+      if (c === "*" && pat[i + 1] === "*") {
+        if (pat[i + 2] === "/") { re += "(?:.*/)?"; i += 2; } else { re += ".*"; i += 1; }
+      } else if (c === "*") re += "[^/]*";
+      else if (c === "?") re += "[^/]";
+      else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+    if (pat.endsWith("/")) re += ".*";
+    return new RegExp("^" + (pat.includes("/") ? "" : "(?:.*/)?") + re + "$", IS_WIN ? "i" : "");
+  }).filter(Boolean);
+  return (rel) => res.some((r) => r.test(rel));
 }
 
-function planAiChunks(diff, maxChars, maxChunks) {
+// The diff the AI reads. Token savers: deleted files show only their header
+// (--irreversible-delete), context lines and whitespace handling are
+// configurable. A literal --range reads exactly those commits; final-state
+// and normal scans read fork point -> working tree (latest version only).
+function collectDiff(target, scope, ai) {
+  const opts = ["--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/",
+    "--irreversible-delete", "-M", `-U${ai.contextLines}`];
+  if (ai.ignoreWhitespace) opts.push("--ignore-all-space");
+  const head = scope.range && !scope.range.final
+    ? ["diff", scope.range.from, scope.range.to]
+    : diffArgs(scope);
+  return git([...head, ...opts, ...pathspec(scope)], target).trim();
+}
+
+// Commit subjects for the reviewed change: cheap context about intent.
+function commitContext(target, scope, max = 40) {
+  if (scope.staged || !scope.fromRef || scope.fromRef === "HEAD") return "";
+  const rev = scope.range ? `${scope.range.from}..${scope.range.to}` : `${scope.fromRef}..HEAD`;
+  const lines = splitLines(git(["log", "--reverse", "--no-merges", "--format=%h %s", rev], target));
+  if (!lines.length) return "";
+  const shown = lines.length > max
+    ? [...lines.slice(0, max / 2), `... ${lines.length - max} more commits ...`, ...lines.slice(-max / 2)]
+    : lines;
+  return shown.join("\n");
+}
+
+function planAiChunks(diff, maxChars, maxChunks, filter = {}) {
   const parts = diff.split(/^(?=diff --git )/m).map((p) => p.trim()).filter(Boolean);
   const files = [];
   const excluded = [];
   for (const text of parts) {
     const m = /^diff --git a\/.+? b\/(.+)$/m.exec(text);
     const file = m ? m[1] : "(unknown)";
-    if (GENERATED_RE.test(file) || /^Binary files /m.test(text)) {
+    if (filter.keep && !filter.keep.has(keyOf(file))) continue;
+    if (GENERATED_RE.test(file) || /^Binary files /m.test(text) || (filter.exclude && filter.exclude(file))) {
       excluded.push(file);
       continue;
     }
@@ -1590,10 +1648,18 @@ function planAiChunks(diff, maxChars, maxChunks) {
 
   const reviewed = chunks.slice(0, maxChunks);
   const skipped = chunks.slice(maxChunks).flatMap((c) => c.files);
-  return { chunks: reviewed, totalFiles: files.length, skipped, excluded };
+  const chars = reviewed.reduce((n, c) => n + c.text.length, 0);
+  return { chunks: reviewed, totalFiles: files.length, skipped, excluded, chars, allChunks: chunks.length };
 }
 
-function aiReview(scannerDir, plan, runAll, timeoutMs) {
+// ~4 characters per token is a fair average for code diffs.
+const approxTokens = (chars) => Math.round(chars / 4);
+
+function fmtK(n) {
+  return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n);
+}
+
+function aiReview(scannerDir, plan, runAll, timeoutMs, context = "") {
   const claude = globalBin("claude");
   if (!claude) {
     return [{ prompt: "review", status: "SKIP",
@@ -1612,7 +1678,11 @@ function aiReview(scannerDir, plan, runAll, timeoutMs) {
 
   const n = plan.chunks.length;
   process.stdout.write(`${C.dim}AI review: ${n} part(s) x ${names.length} reviewer(s) = ` +
-    `${n * names.length} claude call(s)...${C.end}\n`);
+    `${n * names.length} claude call(s), ~${fmtK(approxTokens(plan.chars) * names.length)} ` +
+    `diff tokens in...${C.end}\n`);
+  const intent = context
+    ? "\n\nCommits in this change (subjects only, for intent):\n" + context + "\n"
+    : "";
 
   const reviews = [];
   // Run Claude in a throwaway directory so it has NOTHING in the target to touch.
@@ -1635,7 +1705,7 @@ function aiReview(scannerDir, plan, runAll, timeoutMs) {
         const full =
           instructions +
           "\n\n---\nYou are operating in READ-ONLY review mode. Do not attempt " +
-          "to modify, create, or run anything — only report findings." + part +
+          "to modify, create, or run anything — only report findings." + part + intent +
           "\n\nHere is the unified diff to review:\n\n```diff\n" +
           plan.chunks[i].text + "\n```\n";
         const [rc, out] = run([claude, "-p"], tmp, timeoutMs, full);
@@ -1668,7 +1738,9 @@ function aiReview(scannerDir, plan, runAll, timeoutMs) {
       if (plan.skipped.length > 200) lines.push(`  ... and ${plan.skipped.length - 200} more`);
     }
     if (plan.excluded.length) {
-      lines.push(`${plan.excluded.length} lockfile/generated/binary file(s) left out on purpose.`);
+      lines.push(`${plan.excluded.length} lockfile/generated/binary/ai_exclude file(s) left out on purpose:`);
+      for (const f of plan.excluded.slice(0, 50)) lines.push(`  ${f}`);
+      if (plan.excluded.length > 50) lines.push(`  ... and ${plan.excluded.length - 50} more`);
     }
     reviews.push({ prompt: "coverage", status: plan.skipped.length ? "PARTIAL" : "PASS",
       output: lines.join("\n") });
@@ -1851,6 +1923,67 @@ function stampFile(d) {
 // --------------------------------------------------------------------------- //
 //  Main
 // --------------------------------------------------------------------------- //
+// --plan-batches N: split the branch's commits into groups of N and print each
+// group's size and AI cost estimate plus a ready command. Makes no AI calls.
+function planBatches(target, scope, size, ai, cmdBase) {
+  const P = (s) => process.stdout.write(s + "\n");
+  if (!scope.fromRef || scope.fromRef === "HEAD") {
+    P("error: no base branch found - pass --base (e.g. --base origin/master).");
+    return 2;
+  }
+  const commits = splitLines(git(["rev-list", "--reverse", "--first-parent", `${scope.fromRef}..HEAD`], target));
+  if (!commits.length) {
+    P(`No commits between the fork point ${scope.fromRef.slice(0, 8)} and HEAD.`);
+    return 0;
+  }
+  const final = ai.final;
+  const fullDiff = final ? collectDiff(target, { ...scope, range: null }, ai) : null;
+
+  const rows = [];
+  for (let i = 0; i < commits.length; i += size) {
+    const group = commits.slice(i, i + size);
+    const from = i === 0 ? scope.fromRef : commits[i - 1];
+    const to = group[group.length - 1];
+    const s = { ...scope, range: { from, to, final } };
+    const files = changedFiles(target, s);
+    const diff = final ? fullDiff : collectDiff(target, s, ai);
+    const plan = planAiChunks(diff, ai.chunkChars, Number.MAX_SAFE_INTEGER,
+      { keep: final ? new Set(files.map(keyOf)) : null, exclude: ai.exclude });
+    rows.push({ n: rows.length + 1, from, to, commits: group.length, files: files.length, plan });
+  }
+
+  const total = rows.reduce((n, r) => n + approxTokens(r.plan.chars), 0);
+  P("");
+  P(`${C.bold}Review plan${C.end}  ${C.dim}${commits.length} commits since fork point ` +
+    `${scope.fromRef.slice(0, 8)} (${scope.base || "base"}), batches of ${size}, ` +
+    `${final ? "final-state (each file once, latest version)" : "literal ranges (each commit's own diff)"}${C.end}`);
+  P("-".repeat(78));
+  P("  #   range                 commits  files  AI parts  ~diff tokens (per reviewer)");
+  for (const r of rows) {
+    const range = `${r.from.slice(0, 8)}..${r.to.slice(0, 8)}`;
+    P(`  ${String(r.n).padEnd(3)} ${range.padEnd(21)} ${String(r.commits).padStart(7)}  ` +
+      `${String(r.files).padStart(5)}  ${String(r.plan.allChunks).padStart(8)}  ` +
+      `${fmtK(approxTokens(r.plan.chars)).padStart(12)}`);
+  }
+  P("-".repeat(78));
+  P(`  total ~${fmtK(total)} diff tokens per reviewer (x6 with --ai-full). ` +
+    `Parts above ai_max_chunks (${ai.maxChunks}) are not reviewed - see each report's coverage entry.`);
+  if (!final) {
+    P(`  ${C.dim}Tip: literal ranges re-review code that later commits rewrite. ` +
+      `--final-state reviews each file once.${C.end}`);
+  }
+  P("");
+  P("Run the free deterministic checks once for the whole branch:");
+  P(`  ${cmdBase} --no-ai --out quality-reports/branch`);
+  P("Then AI-review one batch at a time (read each report before the next):");
+  for (const r of rows) {
+    P(`  ${cmdBase} --range ${r.from.slice(0, 10)}..${r.to.slice(0, 10)}` +
+      `${final ? " --final-state" : ""} --ai-only --out quality-reports/batch-${String(r.n).padStart(2, "0")}`);
+  }
+  P("");
+  return 0;
+}
+
 const HELP = `usage: node scan.js [options]
 
 Read-only quality scanner. Never modifies your code.
@@ -1861,7 +1994,13 @@ Read-only quality scanner. Never modifies your code.
   --base REF           git base ref for the diff (default: auto)
   --only PATH          limit the scan to a path (repeatable)
   --include-existing   count findings on lines you did not change too
+  --range A..B         review only the commits in A..B (B defaults to HEAD)
+  --final-state        with --range: review the latest version of files those
+                       commits touched, each file once across batches
+  --plan-batches N     print N-commit batches with token estimates + commands
+                       (no scanning, no AI calls)
   --no-ai              skip the AI review
+  --ai-only            skip the deterministic checks, run only the AI review
   --ai-full            run all specialized AI reviewers
   --ai-max-chunks N    max diff parts sent to each AI reviewer (default: 10)
   --no-report          print only; write no files
@@ -1889,6 +2028,10 @@ function main(argv) {
         base: { type: "string" },
         only: { type: "string", multiple: true, default: [] },
         "include-existing": { type: "boolean", default: false },
+        range: { type: "string" },
+        "final-state": { type: "boolean", default: false },
+        "plan-batches": { type: "string" },
+        "ai-only": { type: "boolean", default: false },
         "no-ai": { type: "boolean", default: false },
         "ai-full": { type: "boolean", default: false },
         "ai-max-chunks": { type: "string" },
@@ -1939,22 +2082,65 @@ function main(argv) {
   }
 
   const only = args.only.map((o) => toRel(o)).filter((o) => o && o !== ".");
+  const fail = (msg) => {
+    process.stderr.write(`error: ${msg}\n`);
+    return 2;
+  };
+  const wantsRange = args.range || args["plan-batches"];
+  if (wantsRange && !gitRepo) return fail("--range / --plan-batches need a git repository");
+  if (wantsRange && (args.all || args.staged)) return fail("--range / --plan-batches can't be combined with --all or --staged");
+  if (args["final-state"] && !wantsRange) return fail("--final-state only applies with --range or --plan-batches");
+  if (args["ai-only"] && args["no-ai"]) return fail("--ai-only and --no-ai cancel each other out");
+
   let base = null;
   let fromRef = null;
   if (gitRepo && !scopeAll && !args.staged) {
     if (baseArg && !gitOk(["rev-parse", "--verify", "--quiet", baseArg], target)) {
-      process.stderr.write(`error: base ref not found: ${baseArg} (try: git fetch origin)\n`);
-      return 2;
+      return fail(`base ref not found: ${baseArg} (try: git fetch origin)`);
     }
     base = resolveBase(target, baseArg);
     fromRef = base ? mergeBase(target, base) || base : "HEAD";
   }
 
+  let range = null;
+  if (args.range) {
+    const idx = args.range.indexOf("..");
+    if (idx <= 0 || args.range.includes("...")) {
+      return fail(`--range must look like A..B (two dots), got: ${args.range}`);
+    }
+    const m = [null, args.range.slice(0, idx), args.range.slice(idx + 2)];
+    const resolve = (r) => git(["rev-parse", "--verify", "--quiet", `${r}^{commit}`], target).trim();
+    const from = resolve(m[1]);
+    const to = resolve(m[2] || "HEAD");
+    if (!from) return fail(`range start not found: ${m[1]}`);
+    if (!to) return fail(`range end not found: ${m[2]}`);
+    range = { from, to, final: args["final-state"] };
+    // Without a base branch, treat the range start as the fork point.
+    if (!fromRef || fromRef === "HEAD") fromRef = from;
+  }
+
   const scope = {
-    target, staged: args.staged, base, fromRef, only,
+    target, staged: args.staged, base, fromRef, only, range,
     filter: !scopeAll && !args["include-existing"],
     lines: new Map(), changed: new Set(), changedRel: [],
   };
+
+  const ai = {
+    contextLines: Number.isInteger(cfg.ai_context_lines) && cfg.ai_context_lines >= 0 ? cfg.ai_context_lines : 3,
+    ignoreWhitespace: cfg.ai_ignore_whitespace === true,
+    exclude: globMatcher(cfg.ai_exclude),
+    chunkChars: positiveInt(cfg.ai_chunk_chars, 60000),
+    maxChunks: positiveInt(args["ai-max-chunks"] ?? cfg.ai_max_chunks, 10),
+    commitContext: cfg.ai_commit_context !== false,
+    final: args["final-state"],
+  };
+
+  if (args["plan-batches"]) {
+    const q = (s) => (/[\s"]/.test(s) ? `"${s}"` : s);
+    const cmdBase = [`node ${q(path.join(scannerDir, "scan.js"))}`, `--path ${q(target)}`,
+      base ? `--base ${q(base)}` : "", ...only.map((o) => `--only ${q(o)}`)].filter(Boolean).join(" ");
+    return planBatches(target, scope, positiveInt(args["plan-batches"], 10), ai, cmdBase);
+  }
 
   const allFiles = projectFiles(target, gitRepo);
   let files;
@@ -1964,14 +2150,23 @@ function main(argv) {
     scopeDesc = "whole project";
   } else {
     files = changedFiles(target, scope);
-    scopeDesc = args.staged
-      ? "staged changes"
-      : base
-        ? `changed vs ${base}${fromRef !== base ? ` (fork point ${fromRef.slice(0, 8)})` : ""}`
-        : "uncommitted changes (no base branch found)";
-    scope.lines = changedLineMap(target, scope);
+    if (range) {
+      const count = splitLines(git(["rev-list", "--count", `${range.from}..${range.to}`], target))[0] || "?";
+      scopeDesc = `commits ${range.from.slice(0, 8)}..${range.to.slice(0, 8)} (${count} commits` +
+        `${range.final ? ", final state, files not already covered by earlier batches" : ""})`;
+    } else {
+      scopeDesc = args.staged
+        ? "staged changes"
+        : base
+          ? `changed vs ${base}${fromRef !== base ? ` (fork point ${fromRef.slice(0, 8)})` : ""}`
+          : "uncommitted changes (no base branch found)";
+    }
+    // Always fork point -> working tree, so line numbers match the files the
+    // tools read; in a --range this means "new in the branch".
+    scope.lines = changedLineMap(target, { ...scope, range: null });
   }
   if (only.length) scopeDesc += `, only ${only.join(", ")}`;
+  if (args["ai-only"]) scopeDesc += " - AI review only (deterministic checks skipped)";
   scope.changedRel = files;
   scope.changed = new Set(files.map(keyOf));
 
@@ -1985,17 +2180,19 @@ function main(argv) {
   let checks;
   let reviews = [];
   try {
-    checks = runChecks(target, files, scope, disabled, ctx);
+    checks = args["ai-only"] ? [] : runChecks(target, files, scope, disabled, ctx);
 
     if (!args["no-ai"]) {
       if (scopeAll) {
         reviews = [{ prompt: "review", status: "SKIP",
           output: "AI review is diff-based; use a scoped scan (not --all) for AI." }];
       } else {
-        const plan = planAiChunks(collectDiff(target, scope),
-          positiveInt(cfg.ai_chunk_chars, 60000),
-          positiveInt(args["ai-max-chunks"] ?? cfg.ai_max_chunks, 10));
-        reviews = aiReview(scannerDir, plan, args["ai-full"], timeoutMs);
+        // Final-state reads the whole branch diff; keep only this batch's files.
+        const keep = range && range.final ? scope.changed : null;
+        const plan = planAiChunks(collectDiff(target, scope, ai), ai.chunkChars, ai.maxChunks,
+          { keep, exclude: ai.exclude });
+        const context = ai.commitContext ? commitContext(target, scope) : "";
+        reviews = aiReview(scannerDir, plan, args["ai-full"], timeoutMs, context);
       }
     }
   } finally {
@@ -2012,6 +2209,7 @@ function main(argv) {
     scope: scopeDesc,
     file_count: files.length,
     base, fork_point: fromRef && fromRef !== "HEAD" ? fromRef : null,
+    range: range ? { from: range.from, to: range.to, final_state: !!range.final } : null,
     filter: scope.filter
       ? "new findings only (pre-existing ones listed as info; --include-existing to count them)"
       : "all findings",
@@ -2024,7 +2222,8 @@ function main(argv) {
     const outDir = args.out ? path.resolve(args.out) : path.join(process.cwd(), "quality-reports");
     try {
       fs.mkdirSync(outDir, { recursive: true });
-      const stamp = stampFile(now);
+      const stamp = stampFile(now) +
+        (range ? `-range-${range.from.slice(0, 8)}-${range.to.slice(0, 8)}` : "");
       const md = buildMarkdown(meta, checks, reviews);
       fs.writeFileSync(path.join(outDir, `report-${stamp}.md`), md, "utf8");
       fs.writeFileSync(path.join(outDir, "latest.md"), md, "utf8");

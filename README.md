@@ -209,6 +209,7 @@ node scan.js --path E:\path\to\my-project
 | Check only what's staged (pre-commit) | `qg --staged` |
 | **Whole feature branch vs master** (all its commits) | `git fetch origin` then `qg --base origin/master` |
 | Same, one module at a time | `qg --base origin/master --only src/billing` |
+| **AI-review a big branch 10 commits at a time** | `qg --base origin/master --plan-batches 10 --final-state` (prints the commands) |
 | Also count issues that were already there | `qg --base origin/master --include-existing` |
 | Review everything since a release/tag | `qg --base v1.4.0` |
 | Scan a **different** repo, zero-touch | `qg --path ../other-repo` |
@@ -234,7 +235,13 @@ node scan.js --path E:\path\to\my-project
                      origin/main, origin/master…)
 --only PATH          limit the scan (files, findings, diff) to a path; repeatable
 --include-existing   count findings on lines you did NOT change as well
+--range A..B         review only the commits in A..B (B defaults to HEAD)
+--final-state        with --range: review the latest version of the files those
+                     commits touched, each file once across batches
+--plan-batches N     print the branch split into N-commit batches with token
+                     estimates and ready commands (no scan, no AI calls)
 --no-ai              skip the AI review
+--ai-only            skip the deterministic checks; run only the AI review
 --ai-full            run all 6 specialized AI reviewers (review/security/architecture/
                      performance/business-logic/supabase)
 --ai-max-chunks N    max diff parts per AI reviewer (default 10; each = 1 claude call)
@@ -271,6 +278,57 @@ node scan.js --path E:\path\to\my-project
 separately. With the default cap of 10 parts, a very large branch may be only
 partly reviewed — the report's **coverage** entry lists every file that wasn't, so
 raise `--ai-max-chunks` or review module by module with `--only`.
+
+### Reviewing a big branch in batches (e.g. 50 commits, 10 at a time)
+
+The deterministic checks cost no tokens — run them **once** for the whole branch.
+Spend AI tokens batch by batch, reading each report before starting the next.
+
+```powershell
+git fetch origin
+# 1. See the plan: batches, files, ~tokens each, and the exact commands. No AI calls.
+qg --base origin/master --plan-batches 10 --final-state
+
+# 2. Free checks once for the whole branch
+qg --base origin/master --no-ai --out quality-reports/branch
+
+# 3. AI review one batch at a time (commands are printed by step 1)
+qg --base origin/master --range <fork>..<c10> --final-state --ai-only --out quality-reports/batch-01
+qg --base origin/master --range <c10>..<c20> --final-state --ai-only --out quality-reports/batch-02
+...
+```
+
+**Literal ranges vs `--final-state`.**
+
+| | `--range A..B` (literal) | `--range A..B --final-state` |
+|---|---|---|
+| The AI reads | exactly what those commits changed | the **latest** version of the files those commits touched |
+| A file edited in commits 3, 18 and 41 | reviewed 3 times, twice in versions that no longer exist | reviewed **once**, in the first batch that touched it, as it is now |
+| Total tokens | higher (repeats + stale code) | ≈ one whole-branch review, just split up |
+| Use it to | review history commit-group by commit-group, like a PR series | check the branch's end result in pieces you can manage |
+
+For a "can this merge?" review, use `--final-state`.
+
+**What a batch run does:**
+- **AI**: one call per ~60k-char part, with the batch's commit subjects added as
+  context (`ai_commit_context`).
+- **Gitleaks**: only that batch's commits (`--log-opts=A..B`).
+- **Linters** (when not `--ai-only`): the files that batch touched, as they are
+  now. "New" means new in the branch, because the tools read your current
+  files, not old commits.
+- **Reports** are named `report-<time>-range-<from>-<to>.md`. Use `--out` per
+  batch so the `latest.md` files don't overwrite each other.
+
+**Ways to cut tokens** (`quality-gate.config.json`, AI only; linters still scan
+everything):
+
+| Setting | Effect |
+|---|---|
+| `"ai_exclude": ["docs/**", "*.md", "**/__snapshots__/**"]` | Files the AI never reads |
+| `"ai_context_lines": 1` | 1 unchanged line around each change instead of 3 |
+| `"ai_ignore_whitespace": true` | Drops whitespace-only changes (great after a reformat; keep off for Python/YAML) |
+| `--only src/billing` | Review one module per run |
+| always on | Deleted files send only their name, moved files only the rename, and lockfiles, minified, maps and binaries are left out |
 
 **Exit codes:** `0` = ran fine (even with findings). `1` = only with `--strict`
 *and* there were new findings. `2` = bad `--path` or a `--base` ref that doesn't
@@ -353,6 +411,9 @@ Lives next to `scan.js`. Delete it and safe defaults still apply.
   `"enforce"` / `"advisory"` force one or the other.
 - **`ai_max_chunks`** / **`ai_chunk_chars`** — how many diff parts (and how large)
   each AI reviewer gets.
+- **`ai_exclude`**, **`ai_context_lines`**, **`ai_ignore_whitespace`**,
+  **`ai_commit_context`** — trim what the AI reads (see *Reviewing a big branch
+  in batches* in §5).
 
 ### Give Claude your project's rules — `CLAUDE.md`
 
@@ -582,6 +643,8 @@ qg --ai-full                # deep 6-reviewer AI pass before an important PR
 qg --staged                 # only staged changes (pre-commit)
 qg --base origin/master     # a whole feature branch (all commits) vs master
 qg --base origin/master --only src/billing   # ...one module at a time
+qg --base origin/master --plan-batches 10 --final-state   # plan a batched AI review
+qg --base origin/master --range A..B --final-state --ai-only   # one batch
 qg --include-existing       # also count issues already on the base branch
 qg --base v1.4.0            # everything since a release
 qg --path ..\repo --all --no-ai   # one-time full audit of another repo
