@@ -255,7 +255,7 @@ function pathspec(scope) {
 }
 
 function untrackedFiles(target, scope) {
-  if (scope.staged || scope.range) return [];
+  if (scope.staged || scope.range || scope.group) return [];
   return git(["ls-files", "--others", "--exclude-standard", ...pathspec(scope)], target)
     .split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
 }
@@ -284,6 +284,7 @@ function rangeFiles(target, scope) {
 }
 
 function changedFiles(target, scope) {
+  if (scope.group) return scope.group.files;
   if (scope.range) return rangeFiles(target, scope);
   const found = new Set();
   const add = (text) => {
@@ -888,6 +889,12 @@ function runGitleaks(spec, exe, target, scope, ctx) {
     passes.push(["full git history", gitMode([])]);
   } else if (scope.staged) {
     passes.push(["staged changes", preCommit(true)]);
+  } else if (scope.group) {
+    const shas = scope.group.commits.map((c) => c.sha);
+    if (shas.length) {
+      passes.push([`${shas.length} commit(s) of group ${scope.group.id}`,
+        gitMode([`--log-opts=--no-walk ${shas.join(" ")}`])]);
+    }
   } else if (scope.range) {
     const { from, to } = scope.range;
     passes.push([`commits ${from.slice(0, 8)}..${to.slice(0, 8)}`, gitMode([`--log-opts=${from}..${to}`])]);
@@ -1612,7 +1619,7 @@ function commitContext(target, scope, max = 40) {
   const shown = lines.length > max
     ? [...lines.slice(0, max / 2), `... ${lines.length - max} more commits ...`, ...lines.slice(-max / 2)]
     : lines;
-  return shown.join("\n");
+  return "Commits in this change (subjects only, for intent):\n" + shown.join("\n");
 }
 
 function planAiChunks(diff, maxChars, maxChunks, filter = {}) {
@@ -1629,6 +1636,7 @@ function planAiChunks(diff, maxChars, maxChunks, filter = {}) {
     }
     files.push({ file, text, rank: endsWithExt(file, AI_CODE_EXT) ? 0 : 1 });
   }
+  for (const p of filter.extra || []) files.push({ ...p, rank: 0 });
   // Source code first; within a rank, keep a directory's files together.
   files.sort((a, b) => a.rank - b.rank || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
 
@@ -1680,9 +1688,7 @@ function aiReview(scannerDir, plan, runAll, timeoutMs, context = "") {
   process.stdout.write(`${C.dim}AI review: ${n} part(s) x ${names.length} reviewer(s) = ` +
     `${n * names.length} claude call(s), ~${fmtK(approxTokens(plan.chars) * names.length)} ` +
     `diff tokens in...${C.end}\n`);
-  const intent = context
-    ? "\n\nCommits in this change (subjects only, for intent):\n" + context + "\n"
-    : "";
+  const intent = context ? "\n\n" + context + "\n" : "";
 
   const reviews = [];
   // Run Claude in a throwaway directory so it has NOTHING in the target to touch.
@@ -1698,9 +1704,17 @@ function aiReview(scannerDir, plan, runAll, timeoutMs, context = "") {
         continue;
       }
       for (let i = 0; i < n; i++) {
+        // Manifest: say exactly where the rest of the change is, so missing
+        // context is explicit instead of guessed.
+        const manifest = plan.chunks
+          .map((c, j) => (j === i ? null : `  part ${j + 1}: ${c.files.slice(0, 40).join(", ")}` +
+            (c.files.length > 40 ? ` (+${c.files.length - 40} more)` : "")))
+          .filter(Boolean);
+        if (plan.skipped.length) manifest.push(`  not reviewed in any part (budget): ${plan.skipped.length} file(s)`);
         const part = n > 1
           ? `\n\nThis is part ${i + 1} of ${n} of a larger change, split by file. Review ` +
-            "only what is shown; do not speculate about files you cannot see.\n"
+            "only what is shown; do not speculate about files you cannot see. The other parts " +
+            "cover:\n" + manifest.join("\n") + "\n"
           : "";
         const full =
           instructions +
@@ -1923,6 +1937,250 @@ function stampFile(d) {
 // --------------------------------------------------------------------------- //
 //  Main
 // --------------------------------------------------------------------------- //
+// --------------------------------------------------------------------------- //
+//  Feature groups (Group-Id commit trailer)
+//  Commits carrying the same `Group-Id:` trailer are one feature, wherever they
+//  sit in history. Each group is reviewed on its own: its files at their final
+//  version, its full commit messages as the claims to verify. Commits without
+//  a trailer are clustered by shared files; merges are reviewed only for their
+//  conflict resolutions (git show --remerge-diff).
+// --------------------------------------------------------------------------- //
+function loadGroups(target, scope, cfg) {
+  const trailer = /^[A-Za-z0-9-]+$/.test(cfg.group_trailer || "") ? cfg.group_trailer : "Group-Id";
+  const rev = `${scope.fromRef}..HEAD`;
+  const raw = git(["log", "--reverse",
+    `--format=%H%x1f%P%x1f%(trailers:key=${trailer},valueonly,separator=%x2C)%x1f%B%x1e`, rev], target);
+  const commits = [];
+  for (const rec of raw.split("\x1e")) {
+    const [sha, parents, ids, body] = rec.replace(/^\s+/, "").split("\x1f");
+    if (!sha || !/^[0-9a-f]{40}$/.test(sha.trim())) continue;
+    const message = (body || "").trim();
+    commits.push({
+      sha: sha.trim(),
+      merge: (parents || "").trim().split(/\s+/).filter(Boolean).length > 1,
+      ids: [...new Set((ids || "").split(",").map((s) => s.trim()).filter(Boolean))],
+      message, subject: message.split(/\r?\n/)[0], files: [], labelled: false,
+    });
+  }
+  for (const c of commits) c.labelled = c.ids.length > 0;
+
+  const bySha = new Map(commits.map((c) => [c.sha, c]));
+  const names = git(["log", "--reverse", "--no-merges", "--name-only", "-M",
+    "--format=%x1e%H", rev, ...pathspec(scope)], target);
+  for (const rec of names.split("\x1e")) {
+    const lines = splitLines(rec);
+    const c = lines.length ? bySha.get(lines[0]) : null;
+    if (c) c.files = lines.slice(1);
+  }
+
+  // Unlabelled commits: cluster by shared files, ignoring "hub" files that
+  // most commits touch (they would merge everything into one group).
+  const normal = commits.filter((c) => !c.merge);
+  const touches = new Map();
+  for (const c of normal) for (const f of c.files) touches.set(f, (touches.get(f) || 0) + 1);
+  const userHub = globMatcher(cfg.group_hub_files);
+  const isHub = (f) => GENERATED_RE.test(f) || path.basename(f) === "package.json" || userHub(f) ||
+    (normal.length >= 6 && touches.get(f) / normal.length > 0.3);
+  const loose = normal.filter((c) => !c.labelled);
+  const parent = loose.map((_, i) => i);
+  const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const owner = new Map();
+  loose.forEach((c, i) => {
+    for (const f of c.files) {
+      if (isHub(f)) continue;
+      if (owner.has(f)) parent[find(i)] = find(owner.get(f));
+      else owner.set(f, i);
+    }
+  });
+  const clusters = new Map();
+  loose.forEach((c, i) => {
+    const r = find(i);
+    if (!clusters.has(r)) clusters.set(r, []);
+    clusters.get(r).push(c);
+  });
+  let k = 0;
+  for (const cl of clusters.values()) {
+    const id = `ungrouped-${++k}`;
+    for (const c of cl) c.ids = [id];
+  }
+  for (const c of commits) if (c.merge && !c.ids.length) c.ids = ["merges"];
+
+  const groups = new Map();
+  commits.forEach((c, idx) => {
+    for (const id of c.ids) {
+      if (!groups.has(id)) {
+        groups.set(id, { id, first: idx, commits: [], merges: [], auto: !c.labelled });
+      }
+      const g = groups.get(id);
+      (c.merge ? g.merges : g.commits).push(c);
+      if (c.labelled) g.auto = false;
+    }
+  });
+
+  const fileGroups = new Map();
+  for (const g of groups.values()) {
+    const seen = new Map();
+    for (const c of g.commits) for (const f of c.files) seen.set(keyOf(f), f);
+    const all = [...seen.values()].sort();
+    g.files = all.filter((f) => existsFile(target, f));
+    g.deleted = all.filter((f) => !existsFile(target, f));
+    for (const f of all) {
+      const key = keyOf(f);
+      if (!fileGroups.has(key)) fileGroups.set(key, new Set());
+      fileGroups.get(key).add(g.id);
+    }
+  }
+  for (const g of groups.values()) {
+    g.shared = g.files
+      .map((f) => [f, [...fileGroups.get(keyOf(f))].filter((x) => x !== g.id)])
+      .filter(([, others]) => others.length);
+  }
+  return {
+    trailer, commits,
+    groups: [...groups.values()].sort((a, b) => a.first - b.first),
+    fileGroups,
+  };
+}
+
+// Prompt context for one group: its full commit messages are the spec.
+function groupContext(g, maxChars) {
+  const L = [];
+  L.push(`FEATURE GROUP: ${g.id}${g.auto ? " (no Group-Id trailer - grouped by shared files)" : ""}`);
+  L.push("This review covers ONE feature group. Other groups on the branch are reviewed separately.");
+  if (g.commits.length) {
+    L.push("", "Its commits, oldest first, with full messages:");
+    let budget = maxChars;
+    for (const c of g.commits) {
+      let msg = c.message;
+      if (msg.length > budget) {
+        msg = budget > 300
+          ? msg.slice(0, budget) + "\n[... message truncated ...]"
+          : `${c.subject}\n[body omitted - group_message_chars budget used]`;
+      }
+      budget = Math.max(0, budget - msg.length);
+      L.push(`--- commit ${c.sha.slice(0, 10)} ---`, msg);
+    }
+  }
+  if (g.merges.length) {
+    L.push("", "Merge commits in this group - only their conflict resolutions are in the diff " +
+      `(git remerge-diff): ${g.merges.map((m) => m.sha.slice(0, 10)).join(", ")}`);
+  }
+  if (g.shared.length) {
+    L.push("", "SHARED FILES - also changed by other groups. Hunks from those groups may appear " +
+      "in the diff; judge them only against this group's commits:");
+    for (const [f, others] of g.shared.slice(0, 100)) L.push(`  ${f}  (also: ${others.join(", ")})`);
+    if (g.shared.length > 100) L.push(`  ... and ${g.shared.length - 100} more`);
+  }
+  if (g.deleted.length) {
+    L.push("", `Files this group touched that no longer exist at HEAD: ${g.deleted.slice(0, 50).join(", ")}`);
+  }
+  L.push("",
+    "VERIFY THE CLAIMS: the commit messages state intent, invariants, fixes and design decisions. " +
+    "For each concrete claim, check it against the diff. Report claims the code contradicts, and " +
+    "separately list claims you cannot confirm from the code shown - never assume code you cannot " +
+    "see. Tool/test results quoted in messages (e.g. 'tsc 0', 'test 0') cannot be checked from a " +
+    "diff; skip those.");
+  return L.join("\n");
+}
+
+// Conflict resolutions made in merge commits (empty for clean merges).
+function mergeResolutionParts(target, g, ai, scope) {
+  const parts = [];
+  for (const m of g.merges) {
+    const d = git(["show", "--remerge-diff", "--format=", "--no-color", "--no-ext-diff",
+      "--src-prefix=a/", "--dst-prefix=b/", `-U${ai.contextLines}`, m.sha, ...pathspec(scope)], target);
+    for (const text of d.split(/^(?=diff --git )/m).map((t) => t.trim()).filter(Boolean)) {
+      const fm = /^diff --git a\/.+? b\/(.+)$/m.exec(text);
+      parts.push({ file: `${fm ? fm[1] : "(unknown)"} [merge ${m.sha.slice(0, 8)} conflict resolution]`, text });
+    }
+  }
+  return parts;
+}
+
+function groupAiPlan(target, scope, g, ai, fullDiff, maxChunks) {
+  const extra = mergeResolutionParts(target, g, ai, scope);
+  return planAiChunks(fullDiff, ai.chunkChars, maxChunks,
+    { keep: new Set(g.files.map(keyOf)), exclude: ai.exclude, extra });
+}
+
+function safeId(id) {
+  return id.replace(/[^\w.-]/g, "_").slice(0, 40);
+}
+
+// --plan-groups: one row per feature group, plus warnings and commands.
+function planGroups(target, scope, info, ai, cmdBase, maxMsg) {
+  const P = (s) => process.stdout.write(s + "\n");
+  if (!info.commits.length) {
+    P(`No commits between the fork point ${scope.fromRef.slice(0, 8)} and HEAD.`);
+    return 0;
+  }
+  const fullDiff = collectDiff(target, scope, ai);
+  const rows = info.groups.map((g) => {
+    const plan = groupAiPlan(target, scope, g, ai, fullDiff, Number.MAX_SAFE_INTEGER);
+    const ctxChars = groupContext(g, maxMsg).length;
+    return { g, plan, tokens: approxTokens(plan.chars + ctxChars * plan.allChunks) };
+  });
+  const w = Math.min(32, Math.max(5, ...info.groups.map((g) => g.id.length)));
+
+  P("");
+  P(`${C.bold}Feature groups${C.end}  ${C.dim}${info.commits.length} commits since fork point ` +
+    `${scope.fromRef.slice(0, 8)} (${scope.base || "base"}), grouped by the ${info.trailer} trailer${C.end}`);
+  P("-".repeat(w + 58));
+  P(`  ${"group".padEnd(w)}  commits  merges  files  shared  AI parts  ~tokens/reviewer`);
+  for (const r of rows) {
+    const { g } = r;
+    P(`  ${g.id.slice(0, w).padEnd(w)}  ${String(g.commits.length).padStart(7)}  ${String(g.merges.length).padStart(6)}` +
+      `  ${String(g.files.length).padStart(5)}  ${String(g.shared.length).padStart(6)}  ` +
+      `${String(r.plan.allChunks).padStart(8)}  ${fmtK(r.tokens).padStart(16)}`);
+  }
+  P("-".repeat(w + 58));
+  P(`  total ~${fmtK(rows.reduce((n, r) => n + r.tokens, 0))} tokens per reviewer ` +
+    "(diff + commit messages; x6 with --ai-full)");
+
+  const warn = [];
+  const unlabelled = info.commits.filter((c) => !c.merge && !c.labelled);
+  if (unlabelled.length) {
+    warn.push(`${unlabelled.length} commit(s) have no ${info.trailer} trailer - grouped by shared files:`);
+    for (const c of unlabelled.slice(0, 15)) warn.push(`    ${c.sha.slice(0, 10)} ${c.subject.slice(0, 70)}  -> ${c.ids[0]}`);
+    if (unlabelled.length > 15) warn.push(`    ... and ${unlabelled.length - 15} more`);
+  }
+  const singles = info.groups.filter((g) => !g.auto && g.commits.length === 1 && !g.merges.length);
+  if (singles.length) warn.push(`single-commit groups (typo in a ${info.trailer}?): ${singles.map((g) => g.id).join(", ")}`);
+  const hot = [...info.fileGroups].filter(([, s]) => s.size >= 3);
+  if (hot.length) {
+    warn.push(`${hot.length} file(s) changed by 3+ groups - their diffs mix features:`);
+    for (const [f, s] of hot.slice(0, 10)) {
+      const ids = [...s];
+      warn.push(`    ${f}  (${ids.slice(0, 6).join(", ")}${ids.length > 6 ? `, +${ids.length - 6} more` : ""})`);
+    }
+  }
+  const big = rows.filter((r) => r.plan.allChunks > ai.maxChunks);
+  if (big.length) {
+    warn.push(`over ai_max_chunks (${ai.maxChunks}) - add --ai-max-chunks or split with --only: ` +
+      big.map((r) => `${r.g.id} (${r.plan.allChunks} parts)`).join(", "));
+  }
+  if (warn.length) {
+    P("");
+    P(`${C.warn}Check before spending tokens:${C.end}`);
+    for (const l of warn) P(`  ${l}`);
+  }
+
+  P("");
+  P("Run the free deterministic checks once for the whole branch:");
+  P(`  ${cmdBase} --no-ai --out quality-reports/branch`);
+  P("Then AI-review one feature group at a time:");
+  for (const r of rows) {
+    if (!r.plan.allChunks) {
+      P(`  ${C.dim}# ${r.g.id}: nothing for AI to review (clean merges / only excluded files)${C.end}`);
+      continue;
+    }
+    const id = /[\s"]/.test(r.g.id) ? `"${r.g.id}"` : r.g.id;
+    P(`  ${cmdBase} --group ${id} --ai-only --out quality-reports/group-${safeId(r.g.id)}`);
+  }
+  P("");
+  return 0;
+}
+
 // --plan-batches N: split the branch's commits into groups of N and print each
 // group's size and AI cost estimate plus a ready command. Makes no AI calls.
 function planBatches(target, scope, size, ai, cmdBase) {
@@ -1999,6 +2257,10 @@ Read-only quality scanner. Never modifies your code.
                        commits touched, each file once across batches
   --plan-batches N     print N-commit batches with token estimates + commands
                        (no scanning, no AI calls)
+  --plan-groups        print feature groups (Group-Id commit trailer) with
+                       token estimates + commands (no scanning, no AI calls)
+  --group ID           review one feature group: its files at final state,
+                       its full commit messages as claims to verify
   --no-ai              skip the AI review
   --ai-only            skip the deterministic checks, run only the AI review
   --ai-full            run all specialized AI reviewers
@@ -2031,6 +2293,8 @@ function main(argv) {
         range: { type: "string" },
         "final-state": { type: "boolean", default: false },
         "plan-batches": { type: "string" },
+        "plan-groups": { type: "boolean", default: false },
+        group: { type: "string" },
         "ai-only": { type: "boolean", default: false },
         "no-ai": { type: "boolean", default: false },
         "ai-full": { type: "boolean", default: false },
@@ -2087,8 +2351,12 @@ function main(argv) {
     return 2;
   };
   const wantsRange = args.range || args["plan-batches"];
-  if (wantsRange && !gitRepo) return fail("--range / --plan-batches need a git repository");
-  if (wantsRange && (args.all || args.staged)) return fail("--range / --plan-batches can't be combined with --all or --staged");
+  const wantsGroup = args.group !== undefined || args["plan-groups"];
+  const modes = [args.range && "--range", args["plan-batches"] && "--plan-batches",
+    args["plan-groups"] && "--plan-groups", args.group !== undefined && "--group",
+    args.all && "--all", args.staged && "--staged"].filter(Boolean);
+  if (modes.length > 1) return fail(`${modes.join(" and ")} can't be combined`);
+  if ((wantsRange || wantsGroup) && !gitRepo) return fail(`${modes[0]} needs a git repository`);
   if (args["final-state"] && !wantsRange) return fail("--final-state only applies with --range or --plan-batches");
   if (args["ai-only"] && args["no-ai"]) return fail("--ai-only and --no-ai cancel each other out");
 
@@ -2135,11 +2403,24 @@ function main(argv) {
     final: args["final-state"],
   };
 
+  const q = (s) => (/[\s"]/.test(s) ? `"${s}"` : s);
+  const cmdBase = [`node ${q(path.join(scannerDir, "scan.js"))}`, `--path ${q(target)}`,
+    base ? `--base ${q(base)}` : "", ...only.map((o) => `--only ${q(o)}`)].filter(Boolean).join(" ");
   if (args["plan-batches"]) {
-    const q = (s) => (/[\s"]/.test(s) ? `"${s}"` : s);
-    const cmdBase = [`node ${q(path.join(scannerDir, "scan.js"))}`, `--path ${q(target)}`,
-      base ? `--base ${q(base)}` : "", ...only.map((o) => `--only ${q(o)}`)].filter(Boolean).join(" ");
     return planBatches(target, scope, positiveInt(args["plan-batches"], 10), ai, cmdBase);
+  }
+
+  const maxMsg = positiveInt(cfg.group_message_chars, 8000);
+  if (wantsGroup) {
+    if (!base) return fail("feature groups need a base branch - pass --base (e.g. --base origin/master)");
+    const info = loadGroups(target, scope, cfg);
+    if (args["plan-groups"]) return planGroups(target, scope, info, ai, cmdBase, maxMsg);
+    const g = info.groups.find((x) => x.id === args.group);
+    if (!g) {
+      return fail(`unknown group '${args.group}'. Groups on this branch: ` +
+        (info.groups.map((x) => x.id).join(", ") || "(none)"));
+    }
+    scope.group = g;
   }
 
   const allFiles = projectFiles(target, gitRepo);
@@ -2150,7 +2431,11 @@ function main(argv) {
     scopeDesc = "whole project";
   } else {
     files = changedFiles(target, scope);
-    if (range) {
+    if (scope.group) {
+      const g = scope.group;
+      scopeDesc = `feature group ${g.id} (${g.commits.length} commits` +
+        `${g.merges.length ? `, ${g.merges.length} merges` : ""}, final state)`;
+    } else if (range) {
       const count = splitLines(git(["rev-list", "--count", `${range.from}..${range.to}`], target))[0] || "?";
       scopeDesc = `commits ${range.from.slice(0, 8)}..${range.to.slice(0, 8)} (${count} commits` +
         `${range.final ? ", final state, files not already covered by earlier batches" : ""})`;
@@ -2187,11 +2472,18 @@ function main(argv) {
         reviews = [{ prompt: "review", status: "SKIP",
           output: "AI review is diff-based; use a scoped scan (not --all) for AI." }];
       } else {
-        // Final-state reads the whole branch diff; keep only this batch's files.
-        const keep = range && range.final ? scope.changed : null;
-        const plan = planAiChunks(collectDiff(target, scope, ai), ai.chunkChars, ai.maxChunks,
-          { keep, exclude: ai.exclude });
-        const context = ai.commitContext ? commitContext(target, scope) : "";
+        let plan;
+        let context;
+        if (scope.group) {
+          plan = groupAiPlan(target, scope, scope.group, ai, collectDiff(target, scope, ai), ai.maxChunks);
+          context = groupContext(scope.group, maxMsg);
+        } else {
+          // Final-state reads the whole branch diff; keep only this batch's files.
+          const keep = range && range.final ? scope.changed : null;
+          plan = planAiChunks(collectDiff(target, scope, ai), ai.chunkChars, ai.maxChunks,
+            { keep, exclude: ai.exclude });
+          context = ai.commitContext ? commitContext(target, scope) : "";
+        }
         reviews = aiReview(scannerDir, plan, args["ai-full"], timeoutMs, context);
       }
     }
@@ -2210,6 +2502,12 @@ function main(argv) {
     file_count: files.length,
     base, fork_point: fromRef && fromRef !== "HEAD" ? fromRef : null,
     range: range ? { from: range.from, to: range.to, final_state: !!range.final } : null,
+    group: scope.group ? {
+      id: scope.group.id,
+      commits: scope.group.commits.map((c) => c.sha),
+      merges: scope.group.merges.map((c) => c.sha),
+      shared_files: scope.group.shared.map(([f, others]) => ({ file: f, also: others })),
+    } : null,
     filter: scope.filter
       ? "new findings only (pre-existing ones listed as info; --include-existing to count them)"
       : "all findings",
@@ -2223,7 +2521,8 @@ function main(argv) {
     try {
       fs.mkdirSync(outDir, { recursive: true });
       const stamp = stampFile(now) +
-        (range ? `-range-${range.from.slice(0, 8)}-${range.to.slice(0, 8)}` : "");
+        (range ? `-range-${range.from.slice(0, 8)}-${range.to.slice(0, 8)}` : "") +
+        (scope.group ? `-group-${safeId(scope.group.id)}` : "");
       const md = buildMarkdown(meta, checks, reviews);
       fs.writeFileSync(path.join(outDir, `report-${stamp}.md`), md, "utf8");
       fs.writeFileSync(path.join(outDir, "latest.md"), md, "utf8");

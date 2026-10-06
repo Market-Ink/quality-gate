@@ -209,6 +209,7 @@ node scan.js --path E:\path\to\my-project
 | Check only what's staged (pre-commit) | `qg --staged` |
 | **Whole feature branch vs master** (all its commits) | `git fetch origin` then `qg --base origin/master` |
 | Same, one module at a time | `qg --base origin/master --only src/billing` |
+| **AI-review a big branch one feature at a time** (`Group-Id` trailers) | `qg --base origin/master --plan-groups` (prints the commands) |
 | **AI-review a big branch 10 commits at a time** | `qg --base origin/master --plan-batches 10 --final-state` (prints the commands) |
 | Also count issues that were already there | `qg --base origin/master --include-existing` |
 | Review everything since a release/tag | `qg --base v1.4.0` |
@@ -240,6 +241,10 @@ node scan.js --path E:\path\to\my-project
                      commits touched, each file once across batches
 --plan-batches N     print the branch split into N-commit batches with token
                      estimates and ready commands (no scan, no AI calls)
+--plan-groups        print the feature groups (Group-Id commit trailer) with token
+                     estimates and ready commands (no scan, no AI calls)
+--group ID           review one feature group: its files at their final version,
+                     its full commit messages as claims to verify
 --no-ai              skip the AI review
 --ai-only            skip the deterministic checks; run only the AI review
 --ai-full            run all 6 specialized AI reviewers (review/security/architecture/
@@ -279,7 +284,64 @@ separately. With the default cap of 10 parts, a very large branch may be only
 partly reviewed — the report's **coverage** entry lists every file that wasn't, so
 raise `--ai-max-chunks` or review module by module with `--only`.
 
+### Reviewing a big branch by feature (recommended): `Group-Id` trailers
+
+A branch usually holds several features whose commits interleave (feature A in
+commits 10 and 12, feature B in 11). Fixed-size batches cut features in half.
+Instead, tag each commit with a git trailer naming its feature:
+
+```
+Inbox 5i: window escape hatch
+
+...message body: intent, invariants, fixes...
+
+Group-Id: conversations-inbox
+```
+
+Then review **one feature per run**, whatever its position in history:
+
+```powershell
+git fetch origin
+qg --base origin/master --plan-groups                       # groups, files, ~tokens, warnings, commands
+qg --base origin/master --no-ai --out quality-reports/branch  # free checks, once
+qg --base origin/master --group conversations-inbox --ai-only --out quality-reports/group-conversations-inbox
+```
+
+**What one `--group` run sends to the AI:**
+- **Only that feature's files**, at their final version. Each file appears once,
+  and no other feature's files are mixed in.
+- **The group's full commit messages**, oldest first (up to
+  `group_message_chars`). The reviewer is told to check every concrete claim in
+  them against the code: "the worker now imports it", "inserted oldest-first +
+  resume token", "the client is told what it may do". It reports claims the code
+  contradicts, and lists those it can't confirm. Quoted tool results such as
+  `tsc 0` are skipped.
+- **Shared files**, i.e. files also changed by other groups, listed by name with
+  those groups. Their diff may contain other features' hunks, and the reviewer is
+  told to judge them only against this group's commits.
+- **A manifest** when a group needs several parts: each part lists which files
+  the other parts cover, so the reviewer knows what's missing instead of
+  guessing.
+
+**Edge cases:**
+- **No trailer:** commits are grouped by shared files (`ungrouped-1`, …), ignoring
+  hub files like `package.json`, lockfiles, `group_hub_files`, and anything
+  touched by more than 30% of commits. The plan lists every such commit so you
+  can see it.
+- **Merge commits:** never mixed into feature groups. A merge group is reviewed
+  with `git show --remerge-diff`, which shows only the conflict resolutions; clean
+  merges cost nothing.
+- **A commit in two features:** `Group-Id: billing, inbox` puts it in both.
+- **Gitleaks** scans only the group's commits; **linters** check the group's files
+  (or run them once for the branch and use `--ai-only`).
+- **Warnings in the plan:** commits without a trailer, single-commit groups
+  (possible typo), files changed by 3+ groups, and groups that exceed
+  `ai_max_chunks`.
+
 ### Reviewing a big branch in batches (e.g. 50 commits, 10 at a time)
+
+Use this when commits have no `Group-Id` trailer, or when you want to review
+history in order.
 
 The deterministic checks cost no tokens — run them **once** for the whole branch.
 Spend AI tokens batch by batch, reading each report before starting the next.
@@ -414,6 +476,9 @@ Lives next to `scan.js`. Delete it and safe defaults still apply.
 - **`ai_exclude`**, **`ai_context_lines`**, **`ai_ignore_whitespace`**,
   **`ai_commit_context`** — trim what the AI reads (see *Reviewing a big branch
   in batches* in §5).
+- **`group_trailer`** (default `Group-Id`), **`group_message_chars`** (8000),
+  **`group_hub_files`** — feature-group review (see *Reviewing a big branch by
+  feature* in §5).
 
 ### Give Claude your project's rules — `CLAUDE.md`
 
@@ -643,6 +708,8 @@ qg --ai-full                # deep 6-reviewer AI pass before an important PR
 qg --staged                 # only staged changes (pre-commit)
 qg --base origin/master     # a whole feature branch (all commits) vs master
 qg --base origin/master --only src/billing   # ...one module at a time
+qg --base origin/master --plan-groups        # plan a per-feature AI review (Group-Id)
+qg --base origin/master --group <id> --ai-only   # review one feature
 qg --base origin/master --plan-batches 10 --final-state   # plan a batched AI review
 qg --base origin/master --range A..B --final-state --ai-only   # one batch
 qg --include-existing       # also count issues already on the base branch

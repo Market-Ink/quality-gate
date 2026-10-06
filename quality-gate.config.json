@@ -29,5 +29,14 @@
   "_ai_ignore_whitespace": "true = drop whitespace-only changes from the AI diff (big savings after a reformat). Keep false for Python/YAML, where indentation matters.",
 
   "ai_commit_context": true,
-  "_ai_commit_context": "Send the reviewed commits' subject lines (max 40) with the diff so the reviewer knows the intent."
+  "_ai_commit_context": "Send the reviewed commits' subject lines (max 40) with the diff so the reviewer knows the intent.",
+
+  "group_trailer": "Group-Id",
+  "_group_trailer": "Commit trailer that names a commit's feature group (--plan-groups / --group). Comma-separate values to put a commit in several groups.",
+
+  "group_message_chars": 8000,
+  "_group_message_chars": "Max characters of full commit messages sent with each group's review. Beyond it, later commits keep only their subject line.",
+
+  "group_hub_files": [],
+  "_group_hub_files": "Globs that never link unlabelled commits into one group (package.json, lockfiles and files touched by >30% of commits are always hubs)."
 }
