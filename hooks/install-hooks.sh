@@ -2,7 +2,9 @@
 # MarketInk Quality Gate — one-time onboarding for a project (macOS/Linux).
 #
 # What it does (all inside the TARGET repo, nothing destructive):
-#   1. Vendors the scanner into  <repo>/.quality-gate/  (scan.js + prompts + config)
+#   1. Vendors the scanner into  <repo>/.quality-gate/  (scan.js, lib, rules,
+#      baselines, prompts) and creates <repo>/.quality-gate.json from the
+#      example if the project doesn't have one yet
 #   2. Installs the hooks into    <repo>/.githooks/       (pre-commit, pre-push)
 #   3. Points git at them:         git config core.hooksPath .githooks
 #   4. Adds quality-reports/ to    <repo>/.gitignore
@@ -32,9 +34,16 @@ echo "Onboarding Quality Gate into: $REPO"
 # 1. Vendor the scanner ------------------------------------------------------
 mkdir -p "$REPO/.quality-gate"
 cp "$TOOL_DIR/scan.js"                  "$REPO/.quality-gate/scan.js"
-cp "$TOOL_DIR/quality-gate.config.json" "$REPO/.quality-gate/quality-gate.config.json"
+for d in lib rules baselines; do
+  rm -rf "$REPO/.quality-gate/$d"
+  cp -R "$TOOL_DIR/$d" "$REPO/.quality-gate/$d"
+done
 [ -d "$TOOL_DIR/.quality" ] && cp -R "$TOOL_DIR/.quality" "$REPO/.quality-gate/"
 echo "  [ok] vendored scanner -> .quality-gate/"
+if [ ! -f "$REPO/.quality-gate.json" ]; then
+  cp "$TOOL_DIR/examples/quality-gate.json" "$REPO/.quality-gate.json"
+  echo "  [ok] created .quality-gate.json (extends the org baseline - edit to taste)"
+fi
 
 # 2. Install the hooks -------------------------------------------------------
 mkdir -p "$REPO/.githooks"
@@ -59,7 +68,7 @@ cat <<'EOF'
 Done. The gate now runs automatically on commit and push in this repo.
 Next:
   1. Commit the setup so it travels with the repo:
-       git add .githooks .quality-gate .gitignore && git commit -m "Add MarketInk Quality Gate hooks"
+       git add .githooks .quality-gate .quality-gate.json .gitignore && git commit -m "Add MarketInk Quality Gate hooks"
   2. Every teammate runs this ONCE after cloning (git can't auto-enable hooks):
        git config core.hooksPath .githooks
 

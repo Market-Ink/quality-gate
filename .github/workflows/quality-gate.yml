@@ -1,0 +1,318 @@
+# MarketInk Quality Gate - REUSABLE workflow.
+#
+# Projects don't copy this file; they call it from a few lines of YAML
+# (see examples/github/quality-gate.yml):
+#
+#   jobs:
+#     quality-gate:
+#       uses: sarthakkk1212/quality-gate/.github/workflows/quality-gate.yml@v2
+#       secrets: inherit
+#
+# What it does on each run:
+#   push          -> deterministic checks on what this push changed (free)
+#   pull_request  -> deterministic checks on the whole PR + the function-level
+#                    AI review (needs the ANTHROPIC_API_KEY secret)
+# It uploads SARIF (inline annotations in GitHub code scanning), the full
+# report as an artifact, posts/updates one PR comment, and fails the job only
+# when the gate configured by `fail-on` is hit. Read-only on the code.
+name: Quality Gate (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      tool-ref:
+        description: Tag/branch of the quality-gate repo to run. Pin a major tag (v2).
+        type: string
+        default: v2
+      tool-repo:
+        description: Repository that holds the quality gate.
+        type: string
+        default: sarthakkk1212/quality-gate
+      base:
+        description: Base ref to diff against. Default - PR base branch, or the previous commit of the push.
+        type: string
+        default: ""
+      ai:
+        description: When to run the AI review - never | pull_request | always
+        type: string
+        default: pull_request
+      fail-on:
+        description: none | deterministic | blocking | any (overrides gate.fail_on in .quality-gate.json)
+        type: string
+        default: ""
+      working-directory:
+        description: Project directory inside the repo (monorepos).
+        type: string
+        default: "."
+      node-version:
+        type: string
+        default: "20"
+      gitleaks-version:
+        type: string
+        default: "8.30.1"
+      upload-sarif:
+        description: Upload findings to GitHub code scanning (needs GitHub Advanced Security on private repos).
+        type: boolean
+        default: true
+      comment:
+        description: Post / update one summary comment on the PR.
+        type: boolean
+        default: true
+      inline-comments:
+        description: Post each verified AI finding as an inline PR comment asking for 👍/👎 (feeds rule precision).
+        type: boolean
+        default: true
+      ai-batch:
+        description: Send the AI review through the Message Batches API (half price; minutes slower).
+        type: boolean
+        default: false
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: Org API key for the AI review. Without it the AI review is skipped.
+        required: false
+      QUALITY_GATE_TOKEN:
+        description: Token that can read tool-repo, if that repo is private.
+        required: false
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed for merge-base / commit ranges
+
+      - name: Fetch Quality Gate (${{ inputs.tool-ref }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.tool-repo }}
+          ref: ${{ inputs.tool-ref }}
+          path: .quality-gate-tool
+          token: ${{ secrets.QUALITY_GATE_TOKEN || github.token }}
+
+      - name: Keep tool, stats and reports out of the scan
+        run: printf '.quality-gate-tool/\n.quality-gate-stats/\nquality-reports/\n' >> .git/info/exclude
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # eslint / prettier / typescript come from the project's own devDependencies.
+      # A failed install only means those checks SKIP; it never fails the job.
+      - name: Install project dependencies
+        working-directory: ${{ inputs.working-directory }}
+        continue-on-error: true
+        run: |
+          if [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then corepack enable && (yarn install --immutable || yarn install --frozen-lockfile)
+          elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci
+          else echo "no lockfile - JS tools will SKIP"; fi
+
+      - name: Install gitleaks ${{ inputs.gitleaks-version }}
+        continue-on-error: true
+        run: |
+          V="${{ inputs.gitleaks-version }}"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Decide scope
+        id: scope
+        env:
+          HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          INPUT_BASE: ${{ inputs.base }}
+          INPUT_AI: ${{ inputs.ai }}
+        run: |
+          if [ -n "$INPUT_BASE" ]; then BASE="$INPUT_BASE"
+          elif [ "$EVENT" = "pull_request" ] || [ "$EVENT" = "pull_request_target" ]; then BASE="origin/$PR_BASE"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE" 2>/dev/null; then BASE="$BEFORE"
+          else BASE="origin/$DEFAULT_BRANCH"; fi
+          AI=false
+          case "$INPUT_AI" in
+            always) AI=true ;;
+            pull_request) case "$EVENT" in pull_request*) AI=true ;; esac ;;
+          esac
+          if [ "$HAS_KEY" != "true" ]; then AI=false; fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "ai=$AI" >> "$GITHUB_OUTPUT"
+          echo "Scanning against $BASE (AI review: $AI)"
+
+      # The AI review calls Claude through the official SDK with the org API key
+      # (prompt caching, structured output, optional Batches). Installed into the
+      # tool folder only - never into the project.
+      - name: Install Anthropic SDK (AI review)
+        if: steps.scope.outputs.ai == 'true'
+        run: npm install --no-save --no-audit --no-fund --prefix "$GITHUB_WORKSPACE/.quality-gate-tool" @anthropic-ai/sdk
+
+      # Per-function review cache: a new push re-reviews only changed functions.
+      - name: Restore AI review cache
+        if: steps.scope.outputs.ai == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/marketink-quality-gate
+          key: qg-review-${{ github.repository }}-${{ github.head_ref || github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            qg-review-${{ github.repository }}-${{ github.head_ref || github.ref_name }}-
+            qg-review-${{ github.repository }}-
+
+      # Rule precision written by the weekly feedback workflow (default-branch
+      # caches are readable from every PR).
+      - name: Restore rule precision stats
+        if: steps.scope.outputs.ai == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: .quality-gate-stats/rule-stats.json
+          key: qg-rule-stats-latest
+          restore-keys: qg-rule-stats-
+
+      - name: Run Quality Gate
+        id: scan
+        continue-on-error: true   # the gate is enforced in the last step, after uploads
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NO_COLOR: "1"
+          BASE: ${{ steps.scope.outputs.base }}
+          AI: ${{ steps.scope.outputs.ai }}
+          FAIL_ON: ${{ inputs.fail-on }}
+          AI_BATCH: ${{ inputs.ai-batch }}
+        run: |
+          set -- --path . --base "$BASE" --out "$GITHUB_WORKSPACE/quality-reports" \
+                 --sarif "$GITHUB_WORKSPACE/quality-reports/quality-gate.sarif"
+          if [ "$AI" != "true" ]; then set -- "$@" --no-ai; else set -- "$@" --ai-backend sdk; fi
+          if [ "$AI" = "true" ] && [ "$AI_BATCH" = "true" ]; then set -- "$@" --ai-batch; fi
+          STATS="$GITHUB_WORKSPACE/.quality-gate-stats/rule-stats.json"
+          if [ -f "$STATS" ]; then set -- "$@" --rule-stats "$STATS"; fi
+          if [ -n "$FAIL_ON" ]; then set -- "$@" --fail-on "$FAIL_ON"; fi
+          node "$GITHUB_WORKSPACE/.quality-gate-tool/scan.js" "$@"
+
+      - name: Upload SARIF to code scanning
+        if: always() && inputs.upload-sarif && hashFiles('quality-reports/quality-gate.sarif') != ''
+        continue-on-error: true   # private repos without GitHub Advanced Security can't receive SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: quality-reports/quality-gate.sarif
+          category: quality-gate
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-report
+          path: quality-reports/
+
+      - name: Comment on the PR
+        if: always() && inputs.comment && github.event_name == 'pull_request'
+        continue-on-error: true   # PRs from forks get a read-only token
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- marketink-quality-gate -->';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            let data = null;
+            try { data = JSON.parse(fs.readFileSync('quality-reports/latest.json', 'utf8')); } catch { data = null; }
+            const lines = [marker, '## 🔍 MarketInk Quality Gate', ''];
+            if (!data) {
+              lines.push('❓ **No report produced** — the scan step failed to run.');
+            } else {
+              const checks = data.checks || [];
+              const count = (s) => checks.filter(c => c.status === s).length;
+              const ai = data.meta.ai_review;
+              const gate = data.meta.gate || { fail_on: 'none', failed: false };
+              const problems = checks.filter(c => c.status === 'FINDINGS' || c.status === 'ERROR');
+              const aiCount = ai ? ai.posted.length : 0;
+              lines.push(gate.failed ? `❌ **Gate failed** (\`${gate.fail_on}\`)`
+                : (problems.length || aiCount) ? '⚠️ **Issues found** (not blocking)' : '✅ **No new issues**');
+              lines.push('', `\`${count('PASS')} passed\` · \`${count('FINDINGS')} findings\` · \`${count('INFO')} info\` · ` +
+                `\`${count('ERROR')} errors\` · \`${count('SKIP') + count('OFF')} skipped\``, '');
+              if (problems.length) {
+                lines.push('| Check | Status | Note |', '|---|---|---|');
+                for (const c of problems) {
+                  const note = (c.note || '').replace(/\|/g, '\\|').split(/\r?\n/)[0].slice(0, 120);
+                  lines.push(`| ${c.title} | ${c.status === 'ERROR' ? '❌' : '⚠️'} ${c.status} | ${note} |`);
+                }
+                lines.push('');
+              }
+              if (ai) {
+                lines.push(`**AI review (changed functions):** ${ai.functions} function(s), ${aiCount} verified finding(s)` +
+                  ` at ${ai.min_severity}+, ${ai.rejected.length} rejected by the evidence check, ` +
+                  `${ai.impacted_files.length} impacted file(s) outside the diff` +
+                  (ai.advisory && ai.advisory.length ? `, ${ai.advisory.length} advisory (low-precision rules)` : '') +
+                  (ai.cache && ai.cache.enabled ? `, ${ai.cache.hits} function(s) from cache` : '') + '.', '');
+                for (const f of ai.posted.slice(0, 10)) {
+                  lines.push(`- **[${f.severity.toUpperCase()}] ${f.rule}** \`${f.file}:${f.line}\` — ${f.title}`);
+                }
+                if (ai.posted.length > 10) lines.push(`- … and ${ai.posted.length - 10} more in the report`);
+                lines.push('');
+              }
+              const u = data.meta.ai_usage;
+              if (u && u.measured) lines.push(`<sub>AI usage: ${u.calls} call(s), ${u.total} tokens (~$${u.cost_usd.toFixed(2)})</sub>`, '');
+            }
+            lines.push(`_Full report: **quality-report** artifact on the [workflow run](${runUrl})._`);
+            const body = lines.join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ owner, repo, issue_number, body });
+
+      # Each verified AI finding becomes an inline comment carrying its
+      # fingerprint; reviewers' 👍/👎 feed rule precision (quality-gate-feedback.yml).
+      - name: Post AI findings inline
+        if: always() && inputs.inline-comments && github.event_name == 'pull_request' && steps.scope.outputs.ai == 'true'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let data;
+            try { data = JSON.parse(fs.readFileSync('quality-reports/latest.json', 'utf8')); } catch { return; }
+            const ai = data.meta && data.meta.ai_review;
+            if (!ai || !ai.posted || !ai.posted.length) return;
+            const { owner, repo } = context.repo;
+            const pull_number = context.issue.number;
+            const commit_id = context.payload.pull_request.head.sha;
+            const prefix = (process.env.WD && process.env.WD !== '.') ? process.env.WD.replace(/\/$/, '') + '/' : '';
+            const existing = await github.paginate(github.rest.pulls.listReviewComments, { owner, repo, pull_number, per_page: 100 });
+            const seen = new Set(existing.map(c => (/qg:finding fp=([0-9a-f]+)/.exec(c.body || '') || [])[1]).filter(Boolean));
+            let posted = 0, skipped = 0;
+            for (const f of ai.posted.slice(0, 25)) {
+              if (seen.has(f.fingerprint)) continue;
+              const evidence = f.evidence.map(e => `- \`${e.file}${e.line ? ':' + e.line : ''}\` — \`${String(e.quote).replace(/`/g, "'")}\``).join('\n');
+              const body = [
+                `<!-- qg:finding fp=${f.fingerprint} rule=${f.rule} -->`,
+                `**[${f.severity.toUpperCase()}] ${f.rule}** — ${f.title}`, '',
+                `**Scenario:** ${f.scenario}`, '', '**Evidence (verified against the file):**', evidence, '',
+                `**Fix:** ${f.fix}`, '',
+                '<sub>MarketInk Quality Gate · React 👍 if this is a real problem, 👎 if it is wrong — it tunes which rules may block merges.</sub>',
+              ].join('\n');
+              try {
+                await github.rest.pulls.createReviewComment({ owner, repo, pull_number, commit_id,
+                  path: prefix + f.file, line: f.line, side: 'RIGHT', body });
+                posted++;
+              } catch (e) {
+                skipped++;   // line not part of the PR diff (e.g. an impacted caller) - it's in the summary comment
+              }
+            }
+            core.info(`inline AI comments: ${posted} posted, ${skipped} outside the diff`);
+        env:
+          WD: ${{ inputs.working-directory }}
+
+      - name: Enforce the gate
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "::error::Quality Gate failed (see the report / PR comment)."
+          exit 1

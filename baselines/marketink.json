@@ -1,0 +1,59 @@
+{
+  "_comment": "MarketInk org baseline. Every project inherits this unless its .quality-gate.json says otherwise (\"extends\": \"marketink\"). Change it by PR to the quality-gate repo; projects pick it up when they move to the new tag.",
+
+  "base_ref": null,
+  "disabled_checks": [],
+  "node_max_old_space_mb": 8192,
+  "format_checks": "auto",
+
+  "ai_max_chunks": 10,
+  "ai_chunk_chars": 60000,
+  "ai_exclude": [],
+  "ai_context_lines": 3,
+  "ai_ignore_whitespace": false,
+  "ai_commit_context": true,
+
+  "group_trailer": "Group-Id",
+  "group_message_chars": 8000,
+  "group_hub_files": [],
+
+  "gate": {
+    "fail_on": "none",
+    "ai_blocking_rules": []
+  },
+
+  "review": {
+    "mode": "functions",
+    "model": null,
+    "rules": { "enable": [], "disable": [], "custom": [] },
+    "context_files": ["CLAUDE.md", "AGENTS.md"],
+    "context_chars": 12000,
+    "skip_paths": [
+      "**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/__mocks__/**",
+      "e2e/**", "**/*.stories.*", "**/*.d.ts"
+    ],
+    "max_functions": 80,
+    "max_callers": 8,
+    "max_callees": 20,
+    "max_body_lines": 200,
+    "caller_context_lines": 4,
+    "min_severity": "medium",
+    "timeout_sec": 600,
+
+    "backend": "auto",
+    "effort": "high",
+    "fallbacks": true,
+    "concurrency": 4,
+    "batch": "never",
+    "batch_min_calls": 6,
+    "batch_wait_sec": 1800,
+    "cache": true,
+    "cache_dir": null,
+    "cache_days": 30,
+    "max_input_tokens": 400000,
+
+    "rule_stats": null,
+    "precision": { "min_samples": 10, "demote_below": 0.5, "promote_above": 0.85 },
+    "impact_for_types": true
+  }
+}

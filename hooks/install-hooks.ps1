@@ -1,7 +1,9 @@
 # MarketInk Quality Gate — one-time onboarding for a project (Windows).
 #
 # What it does (all inside the TARGET repo, nothing destructive):
-#   1. Vendors the scanner into  <repo>/.quality-gate/  (scan.js + prompts + config)
+#   1. Vendors the scanner into  <repo>/.quality-gate/  (scan.js, lib, rules,
+#      baselines, prompts) and creates <repo>/.quality-gate.json from the
+#      example if the project doesn't have one yet
 #   2. Installs the hooks into    <repo>/.githooks/       (pre-commit, pre-push)
 #   3. Points git at them:         git config core.hooksPath .githooks
 #   4. Adds quality-reports/ to    <repo>/.gitignore
@@ -33,11 +35,20 @@ Write-Host "Onboarding Quality Gate into: $Repo" -ForegroundColor Cyan
 $vendor = Join-Path $Repo ".quality-gate"
 New-Item -ItemType Directory -Force -Path $vendor | Out-Null
 Copy-Item (Join-Path $toolDir "scan.js")                 (Join-Path $vendor "scan.js") -Force
-Copy-Item (Join-Path $toolDir "quality-gate.config.json") (Join-Path $vendor "quality-gate.config.json") -Force
+foreach ($d in @("lib", "rules", "baselines")) {
+  $dest = Join-Path $vendor $d
+  if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+  Copy-Item (Join-Path $toolDir $d) $dest -Recurse -Force
+}
 if (Test-Path (Join-Path $toolDir ".quality")) {
   Copy-Item (Join-Path $toolDir ".quality") $vendor -Recurse -Force   # prompts for the AI review
 }
 Write-Host "  [ok] vendored scanner -> .quality-gate\" -ForegroundColor Green
+$projCfg = Join-Path $Repo ".quality-gate.json"
+if (-not (Test-Path $projCfg)) {
+  Copy-Item (Join-Path $toolDir "examples\quality-gate.json") $projCfg
+  Write-Host "  [ok] created .quality-gate.json (extends the org baseline - edit to taste)" -ForegroundColor Green
+}
 
 # 2. Install the hooks -------------------------------------------------------
 $hooksDir = Join-Path $Repo ".githooks"
@@ -65,7 +76,7 @@ Write-Host ""
 Write-Host "Done. The gate now runs automatically on commit and push in this repo." -ForegroundColor Cyan
 Write-Host "Next:" -ForegroundColor Yellow
 Write-Host "  1. Commit the setup so it travels with the repo:"
-Write-Host "       git add .githooks .quality-gate .gitignore && git commit -m 'Add MarketInk Quality Gate hooks'"
+Write-Host "       git add .githooks .quality-gate .quality-gate.json .gitignore && git commit -m 'Add MarketInk Quality Gate hooks'"
 Write-Host "  2. Every teammate runs this ONCE after cloning (git can't auto-enable hooks):"
 Write-Host "       git config core.hooksPath .githooks"
 Write-Host ""

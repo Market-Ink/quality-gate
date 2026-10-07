@@ -1,0 +1,29 @@
+# Copy this file into a project as .github/workflows/quality-gate.yml
+# It calls the org's reusable Quality Gate workflow. Everything else
+# (rules, thresholds, what blocks a merge) lives in the project's
+# .quality-gate.json - see examples/quality-gate.json.
+name: Quality Gate
+
+on:
+  push:            # every commit: free deterministic checks on what the push changed
+  pull_request:    # every PR update: deterministic checks + function-level AI review
+
+concurrency:
+  group: quality-gate-${{ github.ref }}
+  cancel-in-progress: true   # a newer push makes the older run pointless
+
+jobs:
+  quality-gate:
+    # Pin the major tag. Moving to a new baseline is a one-line change here.
+    uses: sarthakkk1212/quality-gate/.github/workflows/quality-gate.yml@v2
+    permissions:
+      contents: read
+      pull-requests: write     # PR summary comment
+      security-events: write   # SARIF upload (inline annotations)
+    with:
+      tool-ref: v2
+      ai: pull_request         # never | pull_request | always
+      # fail-on: deterministic # overrides gate.fail_on from .quality-gate.json
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}       # org secret
+      QUALITY_GATE_TOKEN: ${{ secrets.QUALITY_GATE_TOKEN }}     # only if the tool repo is private

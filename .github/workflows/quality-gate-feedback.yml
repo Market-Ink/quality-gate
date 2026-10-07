@@ -1,0 +1,71 @@
+# MarketInk Quality Gate - REUSABLE feedback workflow (rule precision).
+#
+# Run it on a schedule from each project (see examples/github/quality-gate-feedback.yml).
+# It reads the last N days of:
+#   - 👍 / 👎 reactions on the gate's inline AI-finding comments,
+#   - code-scanning alerts for AI rules (fixed = real, dismissed as false positive = wrong),
+# computes precision per rule, and stores it in the Actions cache on the default
+# branch, where every later PR run picks it up (--rule-stats). Rules with enough
+# feedback and low precision are then demoted to advisory automatically.
+# Read-only: GET requests to the GitHub API only.
+name: Quality Gate feedback (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      tool-ref:
+        type: string
+        default: v2
+      tool-repo:
+        type: string
+        default: sarthakkk1212/quality-gate
+      days:
+        description: Feedback window in days.
+        type: string
+        default: "90"
+      node-version:
+        type: string
+        default: "20"
+    secrets:
+      QUALITY_GATE_TOKEN:
+        required: false
+
+jobs:
+  rule-precision:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: read
+      actions: write   # save the stats to the Actions cache
+    steps:
+      - name: Fetch Quality Gate (${{ inputs.tool-ref }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.tool-repo }}
+          ref: ${{ inputs.tool-ref }}
+          path: .quality-gate-tool
+          token: ${{ secrets.QUALITY_GATE_TOKEN || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Compute rule precision
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node .quality-gate-tool/lib/feedback.js --days "${{ inputs.days }}" \
+            --out .quality-gate-stats/rule-stats.json
+
+      - name: Save stats for PR runs
+        uses: actions/cache/save@v4
+        with:
+          path: .quality-gate-stats/rule-stats.json
+          key: qg-rule-stats-${{ github.run_id }}
+
+      - name: Upload stats
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-gate-rule-stats
+          path: .quality-gate-stats/rule-stats.json

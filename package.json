@@ -1,0 +1,15 @@
+{
+  "name": "marketink-quality-gate",
+  "version": "2.0.0",
+  "private": true,
+  "description": "MarketInk org-wide read-only quality gate: deterministic checks + evidence-verified function-level AI review.",
+  "bin": { "quality-gate": "scan.js" },
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "scan": "node scan.js",
+    "feedback": "node lib/feedback.js"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/sdk": "latest"
+  }
+}

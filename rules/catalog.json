@@ -1,0 +1,116 @@
+{
+  "_comment": "MarketInk Quality Gate rule catalog for the function-level AI review. The reviewer may ONLY report findings under these rule ids. Projects enable/disable rules or add custom ones in .quality-gate.json -> review.rules. Bump 'version' whenever a rule's meaning changes (it is part of the review cache key in later phases).",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "id": "NULL-01", "group": "null-safety", "severity": "medium", "enabled": true,
+      "title": "Nullable value dereferenced without a check",
+      "check": "A value that the packet shows can be null/undefined (a callee signature returning `T | null`/`T | undefined`, an optional property, Array.find, Map.get, a `{ data, error }` result) is dereferenced or passed on without a guard."
+    },
+    {
+      "id": "NULL-02", "group": "null-safety", "severity": "high", "enabled": true,
+      "title": "Caller does not handle a null the changed function can now return",
+      "check": "The changed function can return or resolve null/undefined (or a new empty/partial shape) on some path, and a caller snippet in the packet uses the result without handling that case."
+    },
+    {
+      "id": "ERR-01", "group": "errors", "severity": "medium", "enabled": true,
+      "title": "Error swallowed",
+      "check": "A catch/rejection handler ignores the error or only logs it, and execution continues as if the operation succeeded, so callers or users see success for a failure."
+    },
+    {
+      "id": "ERR-02", "group": "errors", "severity": "high", "enabled": true,
+      "title": "Returned error ignored",
+      "check": "A call that reports failure by return value (e.g. `{ data, error }`, `{ ok: false }`, a Result type, a non-2xx response) has its error ignored and its data used anyway."
+    },
+    {
+      "id": "ERR-03", "group": "errors", "severity": "medium", "enabled": true,
+      "title": "Throw/return contract mismatch",
+      "check": "The changed function now throws where callers in the packet expect a returned error, or returns an error value where callers expect a throw (their try/catch or result check no longer matches)."
+    },
+    {
+      "id": "ASYNC-01", "group": "async", "severity": "high", "enabled": true,
+      "title": "Missing await",
+      "check": "A promise whose result or failure matters (its value is used, ordering matters, or a failure must stop the flow) is not awaited or returned."
+    },
+    {
+      "id": "ASYNC-02", "group": "async", "severity": "medium", "enabled": true,
+      "title": "Floating promise / unhandled rejection",
+      "check": "A promise is started without await, return, .catch or an explicit fire-and-forget marker, in a path where a rejection would be unhandled or lost."
+    },
+    {
+      "id": "ASYNC-03", "group": "async", "severity": "medium", "enabled": true,
+      "title": "Stale state across an await",
+      "check": "State read before an await is used after it without re-checking, so a concurrent change (another request, a re-render, a user switching context) can make the write or UI update apply to the wrong target."
+    },
+    {
+      "id": "CONTRACT-01", "group": "contracts", "severity": "high", "enabled": true,
+      "title": "Call does not match the (changed) signature",
+      "check": "A call site in the packet passes arguments in the wrong order/count/meaning, or uses a return shape the changed function no longer provides."
+    },
+    {
+      "id": "CONTRACT-02", "group": "contracts", "severity": "medium", "enabled": true,
+      "title": "Changed behaviour breaks a caller's visible assumption",
+      "check": "The changed function's new behaviour (units, ordering, side effects, error cases, default values) contradicts an assumption that a caller snippet in the packet visibly relies on."
+    },
+    {
+      "id": "FLOW-01", "group": "flow", "severity": "medium", "enabled": true,
+      "title": "Branch logic error",
+      "check": "A condition is inverted or incomplete, a branch is unreachable, or a state that can occur (shown in the packet) has no branch."
+    },
+    {
+      "id": "FLOW-02", "group": "flow", "severity": "high", "enabled": true,
+      "title": "Early exit skips required work",
+      "check": "A return/throw/continue path skips cleanup, a status update or a required write that the other paths perform (e.g. a record left 'pending'/'sending' forever)."
+    },
+    {
+      "id": "FLOW-03", "group": "flow", "severity": "high", "enabled": true,
+      "title": "Operation can run twice",
+      "check": "A retry, re-entry, redelivery or double submit can repeat a side effect that must happen once (send, charge, insert) because no idempotency guard is visible in the packet."
+    },
+    {
+      "id": "FLOW-04", "group": "flow", "severity": "medium", "enabled": true,
+      "title": "Off-by-one / boundary error",
+      "check": "Loop bounds, slices, pagination cursors, length checks or comparisons are off by one or mishandle the empty/first/last case."
+    },
+    {
+      "id": "PERF-01", "group": "performance", "severity": "medium", "enabled": true,
+      "title": "Sequential I/O in a loop",
+      "check": "An await (query, request, file op) runs inside a loop over a collection that can be large, where a batched or parallel form is available."
+    },
+    {
+      "id": "PERF-02", "group": "performance", "severity": "low", "enabled": true,
+      "title": "Repeated expensive work",
+      "check": "The same query, computation or allocation runs per item / per render when it could be done once (hoisted, memoized, cached)."
+    },
+    {
+      "id": "QUALITY-01", "group": "quality", "severity": "low", "enabled": true,
+      "title": "Duplicated logic",
+      "check": "The changed code re-implements logic that an existing function visible in the packet already provides."
+    },
+    {
+      "id": "QUALITY-02", "group": "quality", "severity": "low", "enabled": false,
+      "title": "Function does too much",
+      "check": "The changed function mixes unrelated responsibilities in a way that makes a specific bug likely (name the bug). Off by default: easy to turn into opinion."
+    },
+    {
+      "id": "QUALITY-03", "group": "quality", "severity": "low", "enabled": true,
+      "title": "Dead code introduced",
+      "check": "The change adds unreachable code, an unused result of a side-effect-free call, or a branch whose condition is always true/false given the packet."
+    },
+    {
+      "id": "SEC-01", "group": "security", "severity": "high", "enabled": true,
+      "title": "Untrusted input reaches a sink unvalidated",
+      "check": "Input from a request, webhook, URL or user reaches a query, HTML, shell command, file path or redirect without validation/escaping visible in the packet."
+    },
+    {
+      "id": "SEC-02", "group": "security", "severity": "high", "enabled": true,
+      "title": "Missing authorization check",
+      "check": "A changed handler reads or writes a record by id without the ownership/role check that sibling code in the packet performs."
+    },
+    {
+      "id": "SEC-03", "group": "security", "severity": "medium", "enabled": true,
+      "title": "Sensitive data exposed",
+      "check": "Tokens, secrets, credentials or personal data are written to logs, error messages, analytics or API responses."
+    }
+  ]
+}

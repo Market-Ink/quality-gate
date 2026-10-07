@@ -3,6 +3,11 @@ quality-reports/
 
 # If this scanner is fetched into a project by CI
 .quality-gate-tool/
+.quality-gate-stats/
+
+# Optional SDK for the AI review (npm install in this folder)
+node_modules/
+package-lock.json
 
 # Python
 __pycache__/

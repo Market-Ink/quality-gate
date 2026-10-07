@@ -283,7 +283,15 @@ function rangeFiles(target, scope) {
   return names.filter((f) => existsFile(target, f)).sort();
 }
 
+// The gate's own vendored copy (hooks), CI checkout and CI stats are never project code.
+const SELF_RE = /^\.quality-gate(-tool|-stats)?\//;
+const notSelf = (f) => !SELF_RE.test(f.split(path.sep).join("/"));
+
 function changedFiles(target, scope) {
+  return changedFilesRaw(target, scope).filter(notSelf);
+}
+
+function changedFilesRaw(target, scope) {
   if (scope.group) return scope.group.files;
   if (scope.range) return rangeFiles(target, scope);
   const found = new Set();
@@ -349,10 +357,10 @@ function walkFiles(target) {
 // Every file in the project that git doesn't ignore (tracked + untracked).
 // Using git here keeps .next/, .env.local and other ignored output out of scope.
 function projectFiles(target, gitRepo) {
-  if (!gitRepo) return walkFiles(target);
+  if (!gitRepo) return walkFiles(target).filter(notSelf);
   return git(["ls-files", "--cached", "--others", "--exclude-standard"], target)
     .split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
-    .filter((f) => existsFile(target, f));
+    .filter((f) => notSelf(f) && existsFile(target, f));
 }
 
 // --------------------------------------------------------------------------- //
@@ -424,6 +432,10 @@ function result(spec, status, note, output, command, extra = {}) {
     id: spec.id, title: extra.title || spec.title, category: spec.cat,
     status, note: note ?? null, output: output || "",
     command: command || null, counts: extra.counts || null,
+    // Structured new findings (file/line/rule/message/level) for SARIF, and
+    // the pre-existing ones (so tsc errors in callers can be promoted later).
+    items: extra.items || [],
+    old_items: extra.old_items || [],
   };
 }
 
@@ -476,7 +488,15 @@ function finalize(spec, scope, findings, opts = {}) {
 
   return result(spec, status, notes.join("; ") || null,
     renderFindings(fresh, old, labels), opts.command,
-    { title: opts.title, counts: { new: fresh.length, existing: old.length } });
+    {
+      title: opts.title, counts: { new: fresh.length, existing: old.length },
+      items: opts.advisory ? [] : fresh.slice(0, 2000).map((f) => ({
+        file: f.file, line: f.line || null, rule: f.rule || null, message: f.message, level: f.level,
+      })),
+      old_items: opts.advisory ? [] : old.slice(0, 2000).map((f) => ({
+        file: f.file, line: f.line || null, rule: f.rule || null, message: f.message, level: f.level,
+      })),
+    });
 }
 
 // --------------------------------------------------------------------------- //
@@ -1683,6 +1703,7 @@ function parseClaudeJson(stdout) {
     const u = d.usage || {};
     return {
       text: typeof d.result === "string" ? d.result : "",
+      structured: d.structured_output && typeof d.structured_output === "object" ? d.structured_output : null,
       isError: d.is_error === true,
       usage: {
         input: u.input_tokens || 0,
@@ -1890,7 +1911,7 @@ function printConsole(meta, checks, reviews) {
   }
   for (const s of skippedSummary(checks)) P(`  ${C.dim}[skip]  ${s}${C.end}`);
 
-  if (reviews.length) {
+  if (reviews.length || meta.ai_review) {
     P("");
     P(`  ${C.cyan}AI review${C.end}`);
     for (const [name, statuses] of aiGroups(reviews)) {
@@ -1899,6 +1920,20 @@ function printConsole(meta, checks, reviews) {
       const color = st === "PASS" ? C.ok : st === "ERROR" || st === "PARTIAL" ? C.warn : C.dim;
       const parts = statuses.length > 1 ? `  ${C.dim}(${statuses.length} parts${bad ? `, ${bad} failed` : ""})${C.end}` : "";
       P(`  ${color}[${st.toLowerCase().padEnd(4)}]${C.end}  claude -${name}${parts}`);
+    }
+    const fr = meta.ai_review;
+    if (fr) {
+      const color = fr.posted.length ? C.bad : C.ok;
+      P(`  ${color}[${fr.posted.length ? "FIND" : "PASS"}]${C.end}  functions review - ${fr.posted.length} finding(s) ` +
+        `at ${fr.min_severity}+, ${fr.minor.length} minor, ${fr.rejected.length} rejected by the evidence check`);
+      P(`  ${C.dim}        ${fr.functions} function(s) reviewed, ${fr.impacted_files.length} impacted file(s) ` +
+        `outside the diff${fr.truncated ? `, ${fr.truncated} over max_functions` : ""}${C.end}`);
+      P(`  ${C.dim}        backend ${fr.backend} · ${fr.model}${fr.effort ? ` · effort ${fr.effort}` : ""}` +
+        (fr.cache && fr.cache.enabled ? ` · cache ${fr.cache.hits} hit(s) / ${fr.cache.reviewed} reviewed` : "") +
+        (fr.batch_id ? ` · batch ${fr.batch_id}` : "") + `${C.end}`);
+      if (fr.advisory.length) {
+        P(`  ${C.dim}        ${fr.advisory.length} advisory finding(s) from low-precision rules (not posted, not gating)${C.end}`);
+      }
     }
     const u = meta.ai_usage;
     if (u && u.measured) {
@@ -1919,6 +1954,9 @@ function printConsole(meta, checks, reviews) {
   if (meta.report_path) {
     P(`  ${C.dim}full report: ${meta.report_path}${C.end}`);
   }
+  if (meta.gate && meta.gate.fail_on !== "none") {
+    P(`  ${meta.gate.failed ? C.bad : C.ok}gate (${meta.gate.fail_on}): ${meta.gate.failed ? "FAILED" : "passed"}${C.end}`);
+  }
   P(`  ${C.dim}This scanner made no changes to your code.${C.end}`);
   P("");
 }
@@ -1932,6 +1970,12 @@ function buildMarkdown(meta, checks, reviews) {
   lines.push(`- **Filter:** ${meta.filter}`);
   lines.push(`- **Generated:** ${meta.time}`);
   lines.push(`- **Mode:** read-only scan — no files were modified`);
+  if (meta.config_sources && meta.config_sources.length) {
+    lines.push(`- **Config:** ${meta.config_sources.map((s) => `\`${s}\``).join(" → ")}`);
+  }
+  if (meta.gate) {
+    lines.push(`- **Gate:** fail on \`${meta.gate.fail_on}\` — ${meta.gate.failed ? "**FAILED**" : "passed"}`);
+  }
   lines.push("");
   lines.push("## Summary");
   lines.push("");
@@ -1978,10 +2022,92 @@ function buildMarkdown(meta, checks, reviews) {
     }
   }
 
-  if (reviews.length) {
+  const fr = meta.ai_review;
+  if (fr) {
+    lines.push("## AI review — changed functions");
+    lines.push("");
+    lines.push(`- **Functions reviewed:** ${fr.functions}${fr.truncated ? ` (${fr.truncated} more over max_functions)` : ""}`);
+    lines.push(`- **Verified findings:** ${fr.posted.length} at ${fr.min_severity}+ severity, ${fr.minor.length} minor`);
+    lines.push(`- **Rejected by the evidence check:** ${fr.rejected.length} (rule not enabled, location outside ` +
+      "the reviewed code, or a quote that doesn't exist in the file)");
+    lines.push(`- **Rules:** catalog v${fr.rules_version}`);
+    lines.push(`- **Backend:** ${fr.backend} · model \`${fr.model}\`${fr.effort ? ` · effort \`${fr.effort}\`` : ""}` +
+      (fr.batch_id ? ` · batch \`${fr.batch_id}\`` : ""));
+    if (fr.cache) {
+      lines.push(`- **Cache:** ${fr.cache.enabled ? `${fr.cache.hits} function(s) from cache (re-verified), ` +
+        `${fr.cache.reviewed} reviewed now` : "off"}`);
+    }
+    if (fr.budget) {
+      lines.push(`- **Budget:** ~${fr.budget.estimated_input_tokens} of ${fr.budget.max_input_tokens} input tokens` +
+        (fr.budget.skipped_functions ? `; ${fr.budget.skipped_functions} lower-risk function(s) skipped` : ""));
+    }
+    if (fr.impacted_files.length) {
+      lines.push(`- **Impacted files outside the diff** (callers of changed functions): ` +
+        fr.impacted_files.slice(0, 40).map((f) => `\`${f}\``).join(", ") +
+        (fr.impacted_files.length > 40 ? ` … +${fr.impacted_files.length - 40}` : ""));
+    }
+    for (const n of fr.notes) lines.push(`- _${n}_`);
+    lines.push("");
+    const renderF = (f) => {
+      lines.push(`#### [${f.severity.toUpperCase()}] ${f.rule} — ${f.title}`);
+      lines.push(`\`${f.file}:${f.line}\`${f.symbol ? ` in \`${f.symbol}\`` : ""} · ${f.rule_title}`);
+      lines.push("");
+      lines.push(`**Scenario:** ${f.scenario}`);
+      lines.push("");
+      lines.push("**Evidence (verified against the file):**");
+      for (const e of f.evidence) lines.push(`- \`${e.file}${e.line ? ":" + e.line : ""}\` — \`${String(e.quote).replace(/`/g, "'")}\``);
+      lines.push("");
+      lines.push(`**Fix:** ${f.fix}`);
+      lines.push("");
+    };
+    if (fr.posted.length) {
+      lines.push("### Findings");
+      lines.push("");
+      fr.posted.forEach(renderF);
+    } else {
+      lines.push("No verified findings at the reporting threshold.");
+      lines.push("");
+    }
+    if (fr.minor.length) {
+      lines.push(`<details><summary>Minor findings (${fr.minor.length})</summary>`, "");
+      fr.minor.forEach(renderF);
+      lines.push("</details>", "");
+    }
+    if (fr.advisory.length) {
+      lines.push(`<details><summary>Advisory — rules demoted for low precision (${fr.advisory.length})</summary>`, "");
+      fr.advisory.forEach(renderF);
+      lines.push("</details>", "");
+    }
+    if (fr.precision && fr.precision.rules.length) {
+      const t = fr.precision.thresholds || {};
+      lines.push("### Rule precision (from reviewer feedback)", "");
+      lines.push(`Source: \`${fr.precision.source}\`${fr.precision.generated_at ? ` (${fr.precision.generated_at})` : ""}. ` +
+        `Demoted below ${Math.round((t.demote_below || 0) * 100)}% with ≥${t.min_samples} samples; ` +
+        `eligible to block at ≥${Math.round((t.promote_above || 0) * 100)}%.`, "");
+      lines.push("| Rule | 👍 | 👎 | Precision | Status |", "|---|---:|---:|---:|---|");
+      for (const r of fr.precision.rules) {
+        lines.push(`| ${r.id} | ${r.up} | ${r.down} | ${r.precision == null ? "-" : Math.round(r.precision * 100) + "%"} | ${r.status} |`);
+      }
+      lines.push("");
+    }
+    if (fr.questions.length) {
+      lines.push("### Questions (could not be decided from the code shown — not findings)");
+      lines.push("");
+      for (const q of fr.questions) lines.push(`- ${q}`);
+      lines.push("");
+    }
+    if (fr.rejected.length) {
+      lines.push(`<details><summary>Rejected by the evidence check (${fr.rejected.length})</summary>`, "");
+      for (const r of fr.rejected) lines.push(`- \`${r.rule}\` ${r.file}:${r.line} — ${r.title} — **${r.reason}**`);
+      lines.push("</details>", "");
+    }
+  }
+
+  const legacy = reviews.filter((rv) => rv.mode !== "functions" || rv.status === "SKIP");
+  if (legacy.length) {
     lines.push("## AI Review");
     lines.push("");
-    for (const rv of reviews) {
+    for (const rv of legacy) {
       lines.push(`### Claude - ${rv.prompt} - ${rv.status}`);
       lines.push("");
       if (rv.files && rv.files.length > 1) {
@@ -2347,6 +2473,679 @@ function planBatches(target, scope, size, ai, cmdBase) {
   return 0;
 }
 
+// --------------------------------------------------------------------------- //
+//  Configuration: org baseline <- project .quality-gate.json <- --config
+//  Objects merge key by key, arrays and scalars replace. Keys starting with
+//  "_" are comments. CLI flags override the merged result.
+// --------------------------------------------------------------------------- //
+const VERSION = "2.0.0";
+const PROJECT_CONFIG = ".quality-gate.json";
+const DEFAULT_BASELINE = "marketink";
+const KNOWN_KEYS = new Set([
+  "extends", "base_ref", "disabled_checks", "node_max_old_space_mb", "format_checks",
+  "ai_max_chunks", "ai_chunk_chars", "ai_exclude", "ai_context_lines", "ai_ignore_whitespace",
+  "ai_commit_context", "group_trailer", "group_message_chars", "group_hub_files", "gate", "review",
+]);
+
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+function deepMerge(a, b) {
+  const out = { ...a };
+  for (const [k, v] of Object.entries(b || {})) {
+    if (k.startsWith("_")) continue;
+    out[k] = isPlainObject(v) && isPlainObject(out[k]) ? deepMerge(out[k], v) : v;
+  }
+  return out;
+}
+
+// "marketink" (or "marketink@2") -> baselines/marketink.json in this tool;
+// anything else is a path relative to the file that extends it.
+function resolveExtends(name, fromDir, scannerDir) {
+  if (/^[\w-]+(@[\w.-]+)?$/.test(name)) {
+    return path.join(scannerDir, "baselines", `${name.split("@")[0]}.json`);
+  }
+  return path.resolve(fromDir, name);
+}
+
+function loadConfigFile(file, scannerDir, sources, depth = 0) {
+  if (depth > 5) throw new Error(`extends chain too deep at ${file}`);
+  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!isPlainObject(raw)) throw new Error(`${file}: config must be a JSON object`);
+  let merged = {};
+  if (raw.extends) {
+    const parent = resolveExtends(String(raw.extends), path.dirname(file), scannerDir);
+    if (!fs.existsSync(parent)) throw new Error(`${file}: extends '${raw.extends}' not found (${parent})`);
+    merged = loadConfigFile(parent, scannerDir, sources, depth + 1);
+  }
+  sources.push(file);
+  return deepMerge(merged, raw);
+}
+
+function loadConfig(target, scannerDir, explicit) {
+  const sources = [];
+  const warnings = [];
+  const projectFile = explicit ? path.resolve(explicit) : path.join(target, PROJECT_CONFIG);
+  let cfg;
+  if (explicit && !fs.existsSync(projectFile)) throw new Error(`config not found: ${projectFile}`);
+  if (fs.existsSync(projectFile)) {
+    cfg = loadConfigFile(projectFile, scannerDir, sources);
+  } else {
+    cfg = loadConfigFile(resolveExtends(DEFAULT_BASELINE, scannerDir, scannerDir), scannerDir, sources);
+  }
+  // Pre-2.0 tool-local config: still honoured, below everything else.
+  const legacy = path.join(scannerDir, "quality-gate.config.json");
+  if (fs.existsSync(legacy)) {
+    try {
+      cfg = deepMerge(JSON.parse(fs.readFileSync(legacy, "utf8")), cfg);
+      sources.unshift(legacy);
+      warnings.push("quality-gate.config.json next to scan.js is deprecated - move settings to the " +
+        "project's .quality-gate.json or a baseline");
+    } catch (e) {
+      warnings.push(`ignored broken ${legacy}: ${e.message}`);
+    }
+  }
+  for (const k of Object.keys(cfg)) {
+    if (!k.startsWith("_") && !KNOWN_KEYS.has(k)) warnings.push(`unknown config key '${k}' (typo?)`);
+  }
+  cfg.gate = { fail_on: "none", ai_blocking_rules: [], ...(cfg.gate || {}) };
+  cfg.review = { ...REVIEW_DEFAULTS, ...(cfg.review || {}) };
+  return { cfg, sources, warnings };
+}
+
+const REVIEW_DEFAULTS = {
+  mode: "functions", model: null, rules: { enable: [], disable: [], custom: [] },
+  context_files: ["CLAUDE.md", "AGENTS.md"], context_chars: 12000, skip_paths: [],
+  max_functions: 80, max_callers: 8, max_callees: 20, max_body_lines: 200,
+  caller_context_lines: 4, min_severity: "medium", timeout_sec: 600,
+  // Phase 3 - cost
+  backend: "auto", effort: "high", fallbacks: true, concurrency: 4,
+  batch: "never", batch_min_calls: 6, batch_wait_sec: 1800,
+  cache: true, cache_dir: null, cache_days: 30, max_input_tokens: 400000,
+  // Phase 4 - trust
+  rule_stats: null, precision: { min_samples: 10, demote_below: 0.5, promote_above: 0.85 },
+  impact_for_types: true,
+};
+
+// --------------------------------------------------------------------------- //
+//  Function-level AI review (TS/JS)
+//  The tool computes the facts (changed functions, callers anywhere in the
+//  project, callee signatures) with the project's own TypeScript; the AI
+//  checks them against a fixed rule catalog and must quote real lines; the
+//  tool then verifies every quote against the files before accepting it.
+// --------------------------------------------------------------------------- //
+const SEV_RANK = { high: 3, medium: 2, low: 1 };
+
+const FINDINGS_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["findings", "questions"],
+  properties: {
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["rule", "file", "line", "severity", "title", "scenario", "evidence", "fix"],
+        properties: {
+          rule: { type: "string" },
+          symbol: { type: "string" },
+          file: { type: "string" },
+          line: { type: "integer" },
+          severity: { type: "string", enum: ["high", "medium", "low"] },
+          title: { type: "string" },
+          scenario: { type: "string" },
+          evidence: {
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["file", "line", "quote"],
+              properties: { file: { type: "string" }, line: { type: "integer" }, quote: { type: "string" } },
+            },
+          },
+          fix: { type: "string" },
+        },
+      },
+    },
+    questions: { type: "array", items: { type: "string" } },
+  },
+};
+
+function loadRules(scannerDir, review, all) {
+  const cat = readJson(path.join(scannerDir, "rules", "catalog.json")) || { version: "0", rules: [] };
+  const r = review.rules || {};
+  const on = new Set(r.enable || []);
+  const off = new Set(r.disable || []);
+  const rules = cat.rules.filter((x) =>
+    (all || x.enabled || on.has(x.id) || on.has(x.group)) && !off.has(x.id) && !off.has(x.group));
+  for (const c of r.custom || []) {
+    if (c && c.id && c.check) rules.push({ group: "custom", severity: "medium", title: c.id, ...c });
+  }
+  return { version: cat.version, rules };
+}
+
+function compressRanges(nums) {
+  const out = [];
+  for (const [a, b] of groupLineRanges(nums)) out.push(a === b ? `${a}` : `${a}-${b}`);
+  return out.join(", ");
+}
+
+function groupLineRanges(nums) {
+  const sorted = [...nums].sort((a, b) => a - b);
+  const out = [];
+  for (const n of sorted) {
+    const last = out[out.length - 1];
+    if (last && n <= last[1] + 1) last[1] = n;
+    else out.push([n, n]);
+  }
+  return out;
+}
+
+function projectContext(target, review) {
+  const parts = [];
+  let budget = positiveInt(review.context_chars, 12000);
+  for (const rel of review.context_files || []) {
+    const text = readText(path.join(target, rel), 1000000);
+    if (!text || budget <= 0) continue;
+    const t = text.length > budget ? text.slice(0, budget) + "\n[... truncated ...]" : text;
+    budget -= t.length;
+    parts.push(`--- ${rel} ---\n${t.trim()}`);
+  }
+  return parts.join("\n\n");
+}
+
+// Run lib/impact.js in a child process with its own heap.
+function collectImpact(scannerDir, target, scope, files, ctx, review) {
+  const skip = globMatcher(review.skip_paths);
+  const candidates = files.filter((f) =>
+    endsWithExt(f, JS_EXT) && !skip(f) && !GENERATED_RE.test(f) && scope.lines.has(keyOf(f)));
+  if (!candidates.length) return { packets: [], notes: ["no changed TS/JS source files (tests and skip_paths excluded)"] };
+  const oldRef = scope.staged ? "HEAD" : scope.fromRef || "HEAD";
+  const input = {
+    target,
+    files: candidates.map((rel) => {
+      const entry = scope.lines.get(keyOf(rel));
+      const all = entry === ALL_LINES;
+      return {
+        rel,
+        changedLines: all ? "ALL" : [...entry],
+        oldText: all ? null : git(["show", `${oldRef}:${rel}`], target) || null,
+      };
+    }),
+    defaultRoots: ctx.allFiles.filter((f) => endsWithExt(f, JS_EXT)).slice(0, 5000),
+    limits: {
+      maxFunctions: positiveInt(review.max_functions, 80),
+      maxCallers: positiveInt(review.max_callers, 8),
+      maxCallees: positiveInt(review.max_callees, 20),
+      maxBodyLines: positiveInt(review.max_body_lines, 200),
+      callerContext: positiveInt(review.caller_context_lines, 4),
+    },
+  };
+  const inFile = path.join(ctx.tmpDir, "impact-in.json");
+  const outFile = path.join(ctx.tmpDir, "impact-out.json");
+  fs.writeFileSync(inFile, JSON.stringify(input));
+  const [rc, out] = run([process.execPath, `--max-old-space-size=${ctx.heapMb}`,
+    path.join(scannerDir, "lib", "impact.js"), inFile, outFile], target, ctx.timeoutMs);
+  const res = readJson(outFile);
+  if (rc !== 0 || !res) return { error: `impact analysis failed: ${crashReason(out) || firstLine(out) || rc}` };
+  return res;
+}
+
+function packetText(p, n, inDiff) {
+  const L = [`### PACKET ${n}: ${p.file} :: ${p.name}  [${p.kind}, ${p.status}${p.exported ? ", exported" : ""}]`];
+  L.push(`changed lines: ${compressRanges(p.changedLines)}`);
+  L.push(p.excerpt ? "NEW CODE (excerpt around the changes):" : "NEW CODE:", "```", p.body, "```");
+  if (p.oldBody) L.push("OLD CODE (before this change; not quotable as evidence):", "```", p.oldBody, "```");
+  if (p.callees.length) {
+    L.push(`CALLEES (resolved signatures${p.calleeTotal > p.callees.length ? `, ${p.callees.length} of ${p.calleeTotal}` : ""}):`);
+    for (const c of p.callees) L.push(`- ${c.name}: ${c.signature}${c.file ? `   (${c.file}:${c.line})` : ""}`);
+  }
+  if (p.callers.length) {
+    L.push(`CALLERS (${p.callers.length} of ${p.callerTotal} call sites):`);
+    for (const c of p.callers) {
+      L.push(`- ${c.file}:${c.line} in ${c.enclosing}${c.isTest ? " [test]" : ""}` +
+        `${inDiff(c.file) ? "" : " [NOT in this diff]"}`, "```", c.snippet, "```");
+    }
+  } else if (p.kind === "function" && p.exported) {
+    L.push("CALLERS: none found in the project.");
+  }
+  return L.join("\n");
+}
+
+const normWs = (s) => String(s).replace(/\s+/g, " ").trim();
+// Signature comparison ignores spacing and `=>` vs `:` return notation.
+const sigKey = (s) => String(s).replace(/\s+/g, "").replace(/=>/g, ":").replace(/^[^(]*?:(?=\()/, "");
+
+// Accept a finding only if its rule is enabled, it points at reviewed code and
+// every quoted line exists in the real file (or is a resolved signature).
+function verifyFindings(raw, chunkPackets, rulesById, target) {
+  const ranges = new Map();
+  const addRange = (file, a, b) => {
+    const k = keyOf(file);
+    if (!ranges.has(k)) ranges.set(k, []);
+    ranges.get(k).push([a, b]);
+  };
+  const signatures = [];
+  for (const p of chunkPackets) {
+    addRange(p.file, p.start, p.end);
+    for (const c of p.callers) addRange(c.file, c.start, c.end);
+    for (const c of p.callees) signatures.push(sigKey(`${c.name}${c.signature}`));
+  }
+  const inReviewed = (file, line) => (ranges.get(keyOf(file)) || []).some(([a, b]) => line >= a - 2 && line <= b + 2);
+  const cache = new Map();
+  const linesOf = (rel) => {
+    if (!cache.has(rel)) cache.set(rel, (readText(path.join(target, rel), 5000000) || "").split(/\r?\n/));
+    return cache.get(rel);
+  };
+  const cleanPath = (p) => toRel(String(p || "").replace(/\\/g, "/").replace(/^\.\//, ""));
+  const findQuote = (rel, line, quote) => {
+    const q = normWs(String(quote).split(/\r?\n/).map((l) => l.replace(/^\s*\d+\|\s?/, "")).join("\n"));
+    if (q.length < 3) return 0;
+    const lines = linesOf(rel);
+    const span = Math.max(1, String(quote).split(/\r?\n/).length);
+    for (let i = Math.max(1, line - 3); i <= Math.min(lines.length, line + 3); i++) {
+      if (normWs(lines.slice(i - 1, i - 1 + span).join(" ")).includes(q)) return i;
+    }
+    return 0;
+  };
+
+  const valid = [];
+  const rejected = [];
+  for (const f of raw) {
+    const reject = (why) => rejected.push({ ...f, reason: why });
+    if (!rulesById.has(f.rule)) { reject(`rule '${f.rule}' is not enabled`); continue; }
+    if (!SEV_RANK[f.severity]) { reject(`bad severity '${f.severity}'`); continue; }
+    const file = cleanPath(f.file);
+    if (!inReviewed(file, f.line)) { reject(`${file}:${f.line} is outside the reviewed code`); continue; }
+    let anchored = 0;
+    let bad = null;
+    const evidence = [];
+    for (const e of f.evidence || []) {
+      const efile = cleanPath(e.file || file);
+      const at = findQuote(efile, e.line, e.quote);
+      if (at) {
+        anchored++;
+        evidence.push({ file: efile, line: at, quote: e.quote });
+      } else if (sigKey(e.quote).length > 6 && signatures.some((s) => s.includes(sigKey(e.quote)))) {
+        evidence.push({ file: "(resolved signature)", line: 0, quote: e.quote });
+      } else {
+        bad = `quote not found at ${efile}:${e.line}: "${String(e.quote).slice(0, 80)}"`;
+        break;
+      }
+    }
+    if (bad) { reject(bad); continue; }
+    if (!anchored) { reject("no evidence anchored to a real code line"); continue; }
+    valid.push({ ...f, file, evidence, rule_title: rulesById.get(f.rule).title });
+  }
+  return { valid, rejected };
+}
+
+// Stable across runs even when lines shift: rule + file + the line's text.
+// Shared by SARIF, the PR inline comments and the feedback loop.
+const FP_CACHE = new Map();
+function fingerprintOf(target, ruleId, file, line) {
+  const crypto = require("crypto");
+  if (!FP_CACHE.has(file)) FP_CACHE.set(file, (readText(path.join(target, file), 5000000) || "").split(/\r?\n/));
+  const text = FP_CACHE.get(file)[(line || 1) - 1] || "";
+  return crypto.createHash("sha256").update(`${ruleId}|${file}|${normWs(text)}`).digest("hex").slice(0, 32);
+}
+
+// Riskier packets first, so budgets and call caps cut the least risky work.
+const RISKY_PATH = /(^|\/)(api|server|routes?|handlers?|worker|jobs?|queue|webhooks?|lib|services?|db|supabase|auth|payments?|billing)(\/|$)/i;
+function riskScore(p, inDiff) {
+  const outside = (p.callerFiles || p.callers.map((c) => c.file)).filter((f) => !inDiff(f)).length;
+  return Math.min(outside, 10) * 3 + (p.exported ? 2 : 0) + (RISKY_PATH.test(p.file) ? 2 : 0) +
+    (p.status === "modified" ? 1 : 0) + Math.min(p.changedLines.length, 50) / 25;
+}
+
+// Rule precision from lib/feedback.js. Rules with enough feedback and low
+// precision are demoted to advisory (still reported, never posted or gating).
+function loadPrecision(file, review) {
+  if (!file) return null;
+  const stats = readJson(path.resolve(file));
+  if (!stats || !stats.rules) return { source: file, error: "could not read rule stats", rules: [] };
+  const p = { min_samples: 10, demote_below: 0.5, promote_above: 0.85, ...(review.precision || {}) };
+  const rules = Object.entries(stats.rules).map(([id, r]) => {
+    const up = r.up || 0;
+    const down = r.down || 0;
+    const n = up + down;
+    const precision = n ? up / n : null;
+    let status = "collecting";
+    if (n >= p.min_samples) {
+      status = precision < p.demote_below ? "demoted" : precision >= p.promote_above ? "eligible-to-block" : "ok";
+    }
+    return { id, up, down, samples: n, precision, status };
+  }).sort((a, b) => (a.id < b.id ? -1 : 1));
+  return { source: file, generated_at: stats.generated_at || null, thresholds: p, rules };
+}
+
+function chooseBackend(scannerDir, review, opts) {
+  const want = opts.backend || review.backend || "auto";
+  const backend = require(path.join(scannerDir, "lib", "backend.js"));
+  if (want !== "cli") {
+    const Anthropic = backend.hasApiCredentials()
+      ? backend.loadSdk([scannerDir, process.cwd()]) : null;
+    if (Anthropic) return { kind: "sdk", Anthropic, backend, model: review.model || backend.DEFAULT_MODEL };
+    if (want === "sdk") {
+      return { skip: backend.hasApiCredentials()
+        ? "ai backend 'sdk' requested but @anthropic-ai/sdk is not installed (npm i @anthropic-ai/sdk in the tool folder)"
+        : "ai backend 'sdk' requested but ANTHROPIC_API_KEY is not set" };
+    }
+  }
+  const claude = globalBin("claude");
+  if (!claude) return { skip: "no AI backend: set ANTHROPIC_API_KEY + install @anthropic-ai/sdk, or put the claude CLI on PATH" };
+  return { kind: "cli", claude, backend, model: review.model || null };
+}
+
+function cliCall(claude, model, job, timeoutMs, tmp) {
+  const argv = [claude, "-p", "--output-format", "json", "--json-schema", JSON.stringify(FINDINGS_SCHEMA),
+    "--tools", "", "--strict-mcp-config", "--restricted"];
+  if (model) argv.push("--model", String(model));
+  const [rc, out, stdout] = run(argv, tmp, timeoutMs, `${job.system}\n\n${job.user}`);
+  const parsed = typeof rc === "number" ? parseClaudeJson(stdout) : null;
+  let data = parsed && parsed.structured;
+  if (!data && parsed && parsed.text) {
+    try {
+      data = JSON.parse(parsed.text);
+    } catch {
+      data = null;
+    }
+  }
+  const ok = rc === 0 && parsed && !parsed.isError && data && Array.isArray(data.findings);
+  return {
+    id: job.id, ok, data, usage: parsed ? parsed.usage : null,
+    error: ok ? null : (parsed && parsed.text) || firstLine(out) || "no output",
+  };
+}
+
+async function functionReview(scannerDir, target, scope, files, ctx, review, opts) {
+  const result = {
+    mode: "functions", functions: 0, truncated: 0, impacted_files: [], findings: [],
+    posted: [], minor: [], advisory: [], rejected: [], questions: [], notes: [], calls: [],
+    rules_version: null, backend: null, model: null, effort: null,
+    cache: null, budget: null, batch_id: null, precision: null,
+  };
+  const be = chooseBackend(scannerDir, review, opts);
+  if (be.skip) return { ...result, skip: be.skip };
+  result.backend = be.kind;
+  result.model = be.model || "(claude CLI default)";
+  result.effort = be.kind === "sdk" ? review.effort || "high" : null;
+
+  const impact = collectImpact(scannerDir, target, scope, files, ctx, review);
+  if (impact.error) return { ...result, fallback: impact.error };
+  result.notes.push(...(impact.notes || []));
+  result.truncated = impact.truncated || 0;
+  const inDiff = (f) => scope.changed.has(keyOf(f));
+  const packets = (impact.packets || [])
+    .map((p, i) => ({ p, i, s: riskScore(p, inDiff) }))
+    .sort((a, b) => b.s - a.s || a.i - b.i)
+    .map((x) => x.p);
+  result.functions = packets.length;
+  result.packets_meta = packets.map((p) => ({ file: p.file, name: p.name, callerFiles: p.callerFiles || [] }));
+  if (!packets.length) return { ...result, skip: result.notes[0] || "no changed functions to review" };
+
+  const impacted = new Set();
+  for (const p of packets) for (const f of p.callerFiles || p.callers.map((c) => c.file)) if (!inDiff(f)) impacted.add(f);
+  result.impacted_files = [...impacted].sort();
+
+  const { version, rules } = loadRules(scannerDir, review, opts.allRules);
+  result.rules_version = version;
+  const rulesById = new Map(rules.map((r) => [r.id, r]));
+  const instructions = readText(path.join(scannerDir, ".quality", "prompts", "functions.md")) || "";
+  const projCtx = projectContext(target, review);
+  const facts = (impact.compiler || []).map((c) =>
+    `- ${c.config}: strictNullChecks ${c.strictNullChecks ? "ON" : "OFF"}${c.checkJs ? ", checkJs ON" : ""}`);
+  // Stable prefix first (identical for every call and run -> prompt-cached);
+  // the change context and packets go in the user turn.
+  const prefix = [
+    instructions.trim(),
+    facts.length ? `PROJECT FACTS (from the TypeScript ${impact.typescript} compiler settings):\n` +
+      facts.join("\n") + "\n- The deterministic gate also runs `tsc`; type errors are reported there too." : "",
+    "RULES (report only these; use the id):\n" +
+      rules.map((r) => `- ${r.id} [${r.severity}] ${r.title}: ${r.check}`).join("\n"),
+    projCtx ? "PROJECT CONTEXT (authoritative: documented decisions are intentional - do not report " +
+      "them as problems):\n" + projCtx : "",
+  ].filter(Boolean).join("\n\n");
+  const changeCtx = opts.context ? `CHANGE CONTEXT (intent only, not something to verify):\n${opts.context}\n\n` : "";
+
+  // Per-function cache: a hit skips the call; its findings are re-verified.
+  const { ReviewCache } = require(path.join(scannerDir, "lib", "cache.js"));
+  const cache = new ReviewCache(opts.cacheDir || review.cache_dir || process.env.QG_CACHE_DIR || null, {
+    enabled: opts.cache !== false && review.cache !== false, days: positiveInt(review.cache_days, 30),
+  });
+  const prefixKey = cache.key(prefix, result.model, result.effort || "", JSON.stringify(FINDINGS_SCHEMA));
+  const texts = packets.map((p, i) => {
+    const text = packetText(p, i + 1, inDiff);
+    return { p, text, key: cache.key(prefixKey, text.replace(/^### PACKET \d+:/, "### PACKET:")) };
+  });
+  const hits = [];
+  const misses = [];
+  for (const t of texts) {
+    const entry = cache.get(t.key);
+    if (entry) hits.push({ ...t, entry });
+    else misses.push(t);
+  }
+
+  // Pack misses into calls (riskiest first), then apply the call cap and the
+  // per-run input-token budget.
+  const chunks = [];
+  let cur = [];
+  let size = 0;
+  for (const t of misses) {
+    if (cur.length && size + t.text.length > opts.chunkChars) {
+      chunks.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push(t);
+    size += t.text.length;
+  }
+  if (cur.length) chunks.push(cur);
+  const budget = positiveInt(review.max_input_tokens, 400000);
+  const reviewed = [];
+  const skipped = [];
+  let estimate = 0;
+  for (const c of chunks) {
+    const tokens = Math.ceil((prefix.length + changeCtx.length + c.reduce((n, t) => n + t.text.length, 0)) / 4);
+    if (reviewed.length >= opts.maxChunks || (reviewed.length && estimate + tokens > budget)) {
+      skipped.push(...c);
+      continue;
+    }
+    reviewed.push(c);
+    estimate += tokens;
+  }
+  result.budget = { max_input_tokens: budget, estimated_input_tokens: estimate, skipped_functions: skipped.length };
+  if (skipped.length) {
+    result.notes.push(`${skipped.length} lower-risk function(s) not reviewed (over ai_max_chunks or ` +
+      `review.max_input_tokens): ${skipped.slice(0, 20).map((t) => `${t.p.file} :: ${t.p.name}`).join(", ")}`);
+  }
+
+  const useBatch = be.kind === "sdk" && (opts.batch === true || review.batch === "always" ||
+    (review.batch === "auto" && reviewed.length >= positiveInt(review.batch_min_calls, 6)));
+  process.stdout.write(`${C.dim}AI review (functions, ${be.kind}${useBatch ? " batch" : ""}, ${result.model}): ` +
+    `${packets.length} function(s), ${hits.length} from cache, ${result.impacted_files.length} impacted file(s) ` +
+    `outside the diff, ${reviewed.length} call(s), ~${fmtK(estimate)} input tokens...${C.end}\n`);
+
+  const jobs = reviewed.map((chunk, i) => ({
+    id: `part-${i + 1}`,
+    label: reviewed.length > 1 ? `functions (part ${i + 1}/${reviewed.length})` : "functions",
+    system: prefix,
+    user: `${changeCtx}REVIEW PACKETS (part ${i + 1} of ${reviewed.length}):\n\n` + chunk.map((t) => t.text).join("\n\n"),
+  }));
+  const timeoutMs = positiveInt(review.timeout_sec, 600) * 1000;
+  let outcomes = [];
+  if (jobs.length && be.kind === "sdk") {
+    outcomes = await be.backend.runSdk(be.Anthropic, jobs, {
+      model: be.model, effort: result.effort, schema: FINDINGS_SCHEMA, timeoutMs,
+      concurrency: positiveInt(review.concurrency, 4), fallbacks: review.fallbacks !== false && !useBatch,
+      batch: useBatch, batchWaitSec: positiveInt(review.batch_wait_sec, 1800),
+      log: (s) => process.stdout.write(`${C.dim}${s}${C.end}\n`),
+    });
+  } else if (jobs.length) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "qg-"));
+    try {
+      for (const job of jobs) {
+        process.stdout.write(`${C.dim}  claude -${job.label} ...${C.end}`);
+        const o = cliCall(be.claude, be.model, job, timeoutMs, tmp);
+        process.stdout.write(`${C.dim} ${o.ok ? "done" : "FAILED"}${o.usage ? `, ${fmtUsage(o.usage)}` : ""}${C.end}\n`);
+        outcomes.push(o);
+      }
+    } finally {
+      try {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      } catch {
+        /* best effort cleanup */
+      }
+    }
+  }
+
+  const seen = new Set();
+  const accept = (valid) => {
+    for (const f of valid) {
+      const key = `${f.rule}|${keyOf(f.file)}|${f.line}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.findings.push(f);
+    }
+  };
+  // Which packet does a raw finding belong to (for caching per function)?
+  const owner = (chunk, f) => {
+    const file = keyOf(String(f.file || "").replace(/\\/g, "/").replace(/^\.\//, ""));
+    const within = (fl, a, b) => keyOf(fl) === file && f.line >= a - 2 && f.line <= b + 2;
+    return chunk.find((t) => within(t.p.file, t.p.start, t.p.end)) ||
+      chunk.find((t) => t.p.callers.some((c) => within(c.file, c.start, c.end))) || null;
+  };
+
+  outcomes.forEach((o, i) => {
+    const chunk = reviewed[i];
+    const call = {
+      prompt: jobs[i].label, status: o.ok ? "PASS" : "ERROR", called: true, mode: "functions",
+      usage: o.usage || null, files: [...new Set(chunk.map((t) => t.p.file))],
+      output: o.ok ? "" : o.error || "(no output)",
+    };
+    if (o.batch_id) result.batch_id = o.batch_id;
+    if (o.ok) {
+      const raw = Array.isArray(o.data.findings) ? o.data.findings : [];
+      const { valid, rejected } = verifyFindings(raw, chunk.map((t) => t.p), rulesById, target);
+      accept(valid);
+      result.rejected.push(...rejected);
+      const questions = (o.data.questions || []).filter(Boolean);
+      result.questions.push(...questions);
+      call.output = `${valid.length} verified finding(s), ${rejected.length} rejected`;
+      // Cache every function of a successful call, including "no findings".
+      const per = new Map(chunk.map((t) => [t, []]));
+      for (const f of raw) {
+        const t = owner(chunk, f);
+        if (t) per.get(t).push(f);
+      }
+      chunk.forEach((t, j) => cache.set(t.key, {
+        file: t.p.file, name: t.p.name, findings: per.get(t), questions: j === 0 ? questions : [],
+      }));
+    }
+    result.calls.push(call);
+  });
+
+  for (const h of hits) {
+    const { valid, rejected } = verifyFindings(h.entry.findings || [], [h.p], rulesById, target);
+    accept(valid);
+    result.rejected.push(...rejected.map((r) => ({ ...r, reason: `${r.reason} (cached review)` })));
+    result.questions.push(...(h.entry.questions || []));
+  }
+  const pruned = cache.prune();
+  result.cache = {
+    enabled: cache.enabled, dir: cache.enabled ? cache.dir : null,
+    hits: hits.length, reviewed: reviewed.reduce((n, c) => n + c.length, 0), pruned,
+  };
+
+  // Precision-based demotion, fingerprints, severity split.
+  const precision = loadPrecision(opts.ruleStats || review.rule_stats || process.env.QG_RULE_STATS, review);
+  result.precision = precision;
+  const demoted = new Set(((precision && precision.rules) || []).filter((r) => r.status === "demoted").map((r) => r.id));
+  const min = SEV_RANK[review.min_severity] || SEV_RANK.medium;
+  result.findings.sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity] ||
+    (a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line));
+  for (const f of result.findings) {
+    f.fingerprint = fingerprintOf(target, `ai/${f.rule}`, f.file, f.line);
+    if (demoted.has(f.rule)) result.advisory.push(f);
+    else if (SEV_RANK[f.severity] >= min) result.posted.push(f);
+    else result.minor.push(f);
+  }
+  return result;
+}
+
+// --------------------------------------------------------------------------- //
+//  SARIF 2.1.0 (GitHub code scanning) and the merge gate
+// --------------------------------------------------------------------------- //
+function buildSarif(checks, aiResult, target) {
+  const rules = new Map();
+  const results = [];
+  const fingerprint = (ruleId, file, line) => fingerprintOf(target, ruleId, file, line);
+  const add = (ruleId, title, level, file, line, text) => {
+    if (!rules.has(ruleId)) rules.set(ruleId, { id: ruleId, name: ruleId, shortDescription: { text: title } });
+    results.push({
+      ruleId, level, message: { text },
+      locations: [{ physicalLocation: { artifactLocation: { uri: file }, region: { startLine: Math.max(1, line || 1) } } }],
+      partialFingerprints: { "qualityGate/v1": fingerprint(ruleId, file, line) },
+    });
+  };
+  for (const r of checks.filter((c) => c.status === "FINDINGS")) {
+    for (const it of r.items || []) {
+      if (!it.file) continue;
+      const ruleId = `${r.id}/${it.rule || r.id}`;
+      add(ruleId, `${r.title}: ${it.rule || r.id}`, it.level === "warning" ? "warning" : "error",
+        it.file, it.line, it.message);
+    }
+  }
+  for (const f of (aiResult && aiResult.posted) || []) {
+    add(`ai/${f.rule}`, `AI review: ${f.rule_title || f.rule}`,
+      f.severity === "high" ? "error" : f.severity === "medium" ? "warning" : "note",
+      f.file, f.line, `${f.title}. ${f.scenario} Fix: ${f.fix}`);
+  }
+  return {
+    $schema: "https://json.schemastore.org/sarif-2.1.0.json",
+    version: "2.1.0",
+    runs: [{
+      tool: { driver: { name: "MarketInk Quality Gate", version: VERSION, rules: [...rules.values()] } },
+      results,
+    }],
+  };
+}
+
+// tsc/mypy errors in files that CALL a changed function are caused by the
+// change (a changed signature or return type), even though those files are
+// outside the diff: count them as new.
+function promoteCallerTypeErrors(checks, callerFiles) {
+  const callers = new Set(callerFiles.map(keyOf));
+  const moved = [];
+  for (const r of checks.filter((c) => (c.id === "tsc" || c.id === "mypy") && (c.old_items || []).length)) {
+    const hit = r.old_items.filter((i) => i.file && callers.has(keyOf(i.file)));
+    if (!hit.length) continue;
+    r.old_items = r.old_items.filter((i) => !hit.includes(i));
+    r.items = [...hit, ...(r.items || [])];
+    const errors = r.items.filter((i) => i.level !== "warning").length;
+    if (errors) r.status = "FINDINGS";
+    r.note = `${errors} new (${hit.length} in callers of changed functions)` +
+      (r.old_items.length ? `; ${r.old_items.length} outside changed files` : "");
+    r.output = `In callers of functions this change modified (${hit.length}) - counted as new:\n` +
+      hit.slice(0, 200).map((i) => "  " + fmtFinding(i)).join("\n") + "\n\n" + (r.output || "");
+    moved.push(...hit);
+  }
+  return moved.length;
+}
+
+const FAIL_ON = ["none", "deterministic", "blocking", "any"];
+
+function gateFails(failOn, checks, aiResult, gate) {
+  const det = checks.some((r) => r.status === "FINDINGS");
+  const posted = (aiResult && aiResult.posted) || [];
+  const blocking = posted.filter((f) => (gate.ai_blocking_rules || []).includes(f.rule));
+  if (failOn === "deterministic") return det;
+  if (failOn === "blocking") return det || blocking.length > 0;
+  if (failOn === "any") return det || posted.length > 0;
+  return false;
+}
+
 const HELP = `usage: node scan.js [options]
 
 Read-only quality scanner. Never modifies your code.
@@ -2368,11 +3167,24 @@ Read-only quality scanner. Never modifies your code.
                        its full commit messages as claims to verify
   --no-ai              skip the AI review
   --ai-only            skip the deterministic checks, run only the AI review
-  --ai-full            run all specialized AI reviewers
-  --ai-max-chunks N    max diff parts sent to each AI reviewer (default: 10)
+  --ai-mode MODE       functions (default: changed functions + callers, fixed
+                       rules, verified evidence) | diff (legacy diff review)
+  --ai-full            functions mode: enable every rule; diff mode: all six
+                       specialized reviewers
+  --ai-max-chunks N    max AI calls per reviewer (default: 10)
+  --config FILE        project config (default: <path>/.quality-gate.json,
+                       else the org baseline)
+  --fail-on LEVEL      none | deterministic | blocking | any  (exit 1 when hit;
+                       default from config gate.fail_on)
+  --ai-backend B       auto (default) | sdk (Anthropic SDK + API key) | cli
+  --ai-batch           send the AI review through the Batches API (-50%, slower)
+  --no-cache           don't reuse cached per-function reviews
+  --cache-dir DIR      review cache folder (default ~/.cache/marketink-quality-gate)
+  --rule-stats FILE    rule precision from lib/feedback.js (demotes weak rules)
+  --sarif FILE         also write a SARIF 2.1.0 file (GitHub code scanning)
   --no-report          print only; write no files
   --out DIR            report output dir (default: ./quality-reports)
-  --strict             exit 1 if new findings (for optional CI)
+  --strict             same as --fail-on deterministic
   --timeout SEC        per-tool timeout in seconds (default: 600)
   -h, --help           show this help and exit
 `;
@@ -2382,7 +3194,7 @@ function positiveInt(v, dflt) {
   return Number.isFinite(n) && n > 0 ? n : dflt;
 }
 
-function main(argv) {
+async function main(argv) {
   let args;
   try {
     ({ values: args } = parseArgs({
@@ -2404,6 +3216,15 @@ function main(argv) {
         "no-ai": { type: "boolean", default: false },
         "ai-full": { type: "boolean", default: false },
         "ai-max-chunks": { type: "string" },
+        "ai-mode": { type: "string" },
+        "ai-backend": { type: "string" },
+        "ai-batch": { type: "boolean", default: false },
+        "no-cache": { type: "boolean", default: false },
+        "cache-dir": { type: "string" },
+        "rule-stats": { type: "string" },
+        config: { type: "string" },
+        "fail-on": { type: "string" },
+        sarif: { type: "string" },
         "no-report": { type: "boolean", default: false },
         out: { type: "string" },
         strict: { type: "boolean", default: false },
@@ -2433,13 +3254,36 @@ function main(argv) {
     return 2;
   }
 
-  // Optional config (fully optional; safe defaults if absent).
-  let cfg = {};
-  const cfgPath = path.join(scannerDir, "quality-gate.config.json");
+  // Config: org baseline <- project .quality-gate.json <- --config.
+  let cfg;
+  let configSources;
   try {
-    if (fs.statSync(cfgPath).isFile()) cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")) || {};
-  } catch {
-    // a broken config must never break the scan
+    const loaded = loadConfig(target, scannerDir, args.config);
+    cfg = loaded.cfg;
+    const under = (dir, p) => !path.relative(dir, p).startsWith("..") && !path.isAbsolute(path.relative(dir, p));
+    configSources = loaded.sources.map((s) => (under(target, s)
+      ? path.relative(target, s)
+      : under(scannerDir, s) ? `quality-gate/${path.relative(scannerDir, s)}` : s).split(path.sep).join("/"));
+    for (const w of loaded.warnings) process.stdout.write(`${C.warn}config: ${w}${C.end}\n`);
+  } catch (e) {
+    process.stderr.write(`error: ${e.message}\n`);
+    return 2;
+  }
+  const review = cfg.review;
+  const failOn = args["fail-on"] || (args.strict ? "deterministic" : cfg.gate.fail_on || "none");
+  if (!FAIL_ON.includes(failOn)) {
+    process.stderr.write(`error: --fail-on must be one of ${FAIL_ON.join(", ")} (got '${failOn}')\n`);
+    return 2;
+  }
+  const aiMode = args["ai-mode"] || review.mode || "functions";
+  if (!["functions", "diff"].includes(aiMode)) {
+    process.stderr.write(`error: --ai-mode must be 'functions' or 'diff' (got '${aiMode}')\n`);
+    return 2;
+  }
+  const aiBackend = args["ai-backend"] || review.backend || "auto";
+  if (!["auto", "sdk", "cli"].includes(aiBackend)) {
+    process.stderr.write(`error: --ai-backend must be auto, sdk or cli (got '${aiBackend}')\n`);
+    return 2;
   }
   const disabled = new Set(cfg.disabled_checks || []);
   const baseArg = args.base ?? cfg.base_ref ?? null;
@@ -2569,10 +3413,34 @@ function main(argv) {
 
   let checks;
   let reviews = [];
+  let aiResult = null;
   try {
     checks = args["ai-only"] ? [] : runChecks(target, files, scope, disabled, ctx);
 
-    if (!args["no-ai"]) {
+    let useDiffMode = aiMode === "diff";
+    if (!args["no-ai"] && !scopeAll && aiMode === "functions") {
+      const context = scope.group
+        ? `Feature group ${scope.group.id}:\n` + scope.group.commits.map((c) => `- ${c.subject}`).join("\n")
+        : ai.commitContext ? commitContext(target, scope) : "";
+      const fr = await functionReview(scannerDir, target, scope, files, ctx, review, {
+        allRules: args["ai-full"], context, chunkChars: ai.chunkChars, maxChunks: ai.maxChunks,
+        backend: aiBackend, batch: args["ai-batch"] || undefined,
+        cache: args["no-cache"] ? false : undefined, cacheDir: args["cache-dir"],
+        ruleStats: args["rule-stats"],
+      });
+      if (fr.fallback) {
+        // No usable TypeScript in the project: fall back to the diff review.
+        process.stdout.write(`${C.warn}note: ${fr.fallback} - using the diff review instead.${C.end}\n`);
+        useDiffMode = true;
+      } else if (fr.skip) {
+        reviews = [{ prompt: "functions", status: "SKIP", output: fr.skip, mode: "functions" }];
+      } else {
+        aiResult = { ...fr, min_severity: review.min_severity || "medium" };
+        reviews = fr.calls;
+      }
+    }
+
+    if (!args["no-ai"] && (scopeAll || useDiffMode)) {
       if (scopeAll) {
         reviews = [{ prompt: "review", status: "SKIP",
           output: "AI review is diff-based; use a scoped scan (not --all) for AI." }];
@@ -2590,6 +3458,21 @@ function main(argv) {
           context = ai.commitContext ? commitContext(target, scope) : "";
         }
         reviews = aiReview(scannerDir, plan, args["ai-full"], timeoutMs, context);
+      }
+    }
+
+    // Type errors in callers of changed functions are caused by the change.
+    const hasOutside = checks.some((c) => (c.id === "tsc" || c.id === "mypy") && (c.old_items || []).length);
+    if (hasOutside && !scopeAll && review.impact_for_types !== false) {
+      let callerFiles = aiResult && aiResult.packets_meta
+        ? aiResult.packets_meta.flatMap((p) => p.callerFiles) : null;
+      if (!callerFiles) {
+        const imp = collectImpact(scannerDir, target, scope, files, ctx, { ...review, max_functions: 400 });
+        callerFiles = imp.error ? [] : (imp.packets || []).flatMap((p) => p.callerFiles || []);
+      }
+      const promoted = promoteCallerTypeErrors(checks, callerFiles);
+      if (promoted) {
+        process.stdout.write(`${C.dim}${promoted} type error(s) in callers of changed functions counted as new.${C.end}\n`);
       }
     }
   } finally {
@@ -2617,9 +3500,23 @@ function main(argv) {
       ? "new findings only (pre-existing ones listed as info; --include-existing to count them)"
       : "all findings",
     time: stampHuman(now),
+    version: VERSION,
+    config_sources: configSources,
+    ai_mode: args["no-ai"] ? "off" : aiResult ? "functions" : "diff",
+    ai_review: aiResult ? (({ packets_meta: _omit, ...rest }) => rest)(aiResult) : null,
     ai_usage: reviews.some((r) => r.called) ? usageTotals(reviews) : null,
+    gate: { fail_on: failOn, failed: gateFails(failOn, checks, aiResult, cfg.gate) },
     report_path: null,
   };
+  const sarif = () => JSON.stringify(buildSarif(checks, aiResult, target), null, 2);
+  if (args.sarif) {
+    try {
+      fs.mkdirSync(path.dirname(path.resolve(args.sarif)), { recursive: true });
+      fs.writeFileSync(path.resolve(args.sarif), sarif(), "utf8");
+    } catch (exc) {
+      process.stdout.write(`${C.warn}note: could not write SARIF (${exc.message}).${C.end}\n`);
+    }
+  }
 
   // Write report (the only thing this tool ever writes).
   if (!args["no-report"]) {
@@ -2636,6 +3533,7 @@ function main(argv) {
         path.join(outDir, "latest.json"),
         JSON.stringify({ meta, checks, reviews }, null, 2),
         "utf8");
+      fs.writeFileSync(path.join(outDir, "latest.sarif"), sarif(), "utf8");
       meta.report_path = path.join(outDir, "latest.md");
     } catch (exc) {
       process.stdout.write(`${C.warn}note: could not write report (${exc.message}); printing only.${C.end}\n`);
@@ -2644,10 +3542,12 @@ function main(argv) {
 
   printConsole(meta, checks, reviews);
 
-  if (args.strict && checks.some((r) => r.status === "FINDINGS")) {
-    return 1;
-  }
-  return 0;
+  return meta.gate.failed ? 1 : 0;
 }
 
-process.exit(main(process.argv.slice(2)));
+main(process.argv.slice(2)).then(
+  (code) => process.exit(code),
+  (e) => {
+    process.stderr.write(`error: ${(e && e.stack) || e}\n`);
+    process.exit(2);
+  });

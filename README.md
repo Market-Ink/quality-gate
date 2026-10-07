@@ -1,795 +1,1024 @@
 # MarketInk Quality Gate
 
-A **read-only code scanner** that runs your existing quality tools (linters, type
-checkers, security & dependency scanners) plus an optional scoped **AI review**
-with Claude, and produces one clean report.
+The **organisation-wide quality baseline** for MarketInk projects. It does two
+kinds of review and produces one report:
 
-It is a single Node script (`scan.js`, **zero npm dependencies**) that is safe to
-run on **any project, at any time** — including production repos — because it
-**never changes anything**.
+1. **Deterministic checks.** Your existing linters, type checker, secret
+   scanner, dependency audit and a built-in Supabase check. They run in
+   check-only mode, are free, and run on every commit.
+2. **A function-level AI review.** The tool works out *which functions changed
+   and who calls them anywhere in the project*. Claude then checks those
+   facts against a fixed rule catalog, and the tool **verifies every quoted
+   line** against the real files before a finding is accepted. This runs on
+   every pull request.
 
-> **This README is the one and only doc.** Setup, features, daily usage,
-> onboarding, config, git/CI automation, and troubleshooting are all below.
+It is one Node script (`scan.js`) plus small helpers in `lib/`, with **zero
+required npm dependencies**. The official Anthropic SDK is an *optional* extra
+that CI installs into the tool's own folder. It is **read-only**: it never
+edits code, never changes git state, never installs anything into your project.
+
+**Cost and trust features:**
+- **Pay once per function.** A per-function review cache means re-pushes
+  re-review only the functions that changed.
+- **Cheaper calls.** In CI, calls go through the SDK with prompt caching,
+  optionally via the Batches API at half price.
+- **Bounded spend.** Risk-ordered token budgets cap each run.
+- **Learns from reviewers.** Inline AI comments collect 👍/👎. A weekly job
+  turns them into **per-rule precision**, and rules that are often wrong are
+  demoted to advisory automatically.
+
+> **This README is the one and only doc.** Setup, CI/CD, configuration, the AI
+> review, the rule catalog and troubleshooting are all below.
 
 ---
 
 ## Table of contents
 
 1. [What it is & safety guarantees](#1-what-it-is--safety-guarantees)
-2. [Features — what it runs](#2-features--what-it-runs)
-3. [Requirements & setup](#3-requirements--setup)
-4. [Quick start & daily usage](#4-quick-start--daily-usage)
-5. [Options / flags](#5-options--flags)
-6. [Reading the report](#6-reading-the-report)
-7. [Configuration](#7-configuration)
-8. [Supabase checks](#8-supabase-checks)
-9. [Onboarding a project & git automation](#9-onboarding-a-project--git-automation)
-10. [Troubleshooting](#10-troubleshooting)
-11. [Cheat sheet](#11-cheat-sheet)
-12. [Notes: migration & roadmap](#12-notes-migration--roadmap)
+2. [How it fits together](#2-how-it-fits-together)
+3. [What it runs](#3-what-it-runs)
+4. [Requirements & setup](#4-requirements--setup)
+5. [Quick start & daily usage](#5-quick-start--daily-usage)
+6. [Options / flags](#6-options--flags)
+7. [The AI review: changed functions, verified evidence](#7-the-ai-review-changed-functions-verified-evidence)
+8. [Rule catalog](#8-rule-catalog)
+9. [Configuration: org baseline + project `.quality-gate.json`](#9-configuration-org-baseline--project-quality-gatejson)
+10. [CI/CD with GitHub Actions](#10-cicd-with-github-actions)
+11. [The merge gate (`--fail-on`)](#11-the-merge-gate---fail-on)
+12. [Reading the report (Markdown, JSON, SARIF)](#12-reading-the-report-markdown-json-sarif)
+13. [Big branches: scope, feature groups, batches](#13-big-branches-scope-feature-groups-batches)
+14. [Supabase checks](#14-supabase-checks)
+15. [Local git hooks](#15-local-git-hooks)
+16. [Troubleshooting](#16-troubleshooting)
+17. [Cheat sheet](#17-cheat-sheet)
+18. [Versioning, migration & roadmap](#18-versioning-migration--roadmap)
+19. [Cost controls: backends, cache, budgets, batches](#19-cost-controls-backends-cache-budgets-batches)
+20. [Trust: inline feedback, rule precision, auto-demotion](#20-trust-inline-feedback-rule-precision-auto-demotion)
 
 ---
 
 ## 1. What it is & safety guarantees
 
-The Quality Gate splits code review in a way that plays to each tool's strength:
+| Layer | Owns | Runs | Cost |
+|---|---|---|---|
+| **Deterministic tools** | Anything mechanical: lint, types, formatting, secrets, vulnerable dependencies, Supabase anti-patterns | Every commit (CI push), pre-commit / pre-push hooks, locally | Free |
+| **Function-level AI review** | What a careful human reviewer catches: null handling, ignored errors, missing `await`, caller/callee contract breaks, flow bugs, wasted I/O, obvious security holes | Every PR update (CI), or locally on demand | Cents per PR (see §10) |
 
-- **Deterministic tools** (linters/type/security/dependency scanners) handle
-  everything mechanical — always right, cost nothing to run.
-- **Claude (AI)** handles judgment calls — reading *only your diff* against *your*
-  standards (from the project's `CLAUDE.md`) and explaining real issues in plain
-  language: security holes, broken business logic, bad architecture, perf traps.
+The AI review is **deliberately narrow**. It does not judge business intent,
+product decisions, naming or style, and it may only report a problem that
+matches a rule in the [catalog](#8-rule-catalog), with quoted proof.
 
-**The single most important fact: it is 100% read-only.**
+**It is 100% read-only.**
 
-- ✅ **Never edits, formats, or fixes your code.** Every tool runs in check-only
-  mode (`ruff check --no-fix`, `prettier --list-different`, `mypy`, `pnpm audit`,
-  `gitleaks git`, …). No `--fix`/`--write` flags anywhere. `tsc` runs with
-  `--incremental false` so it can't drop a `.tsbuildinfo` into your repo.
-- ✅ **Never changes git state.** No add, commit, push, checkout, or worktree.
-- ✅ **Never installs anything.** It only runs tools already available.
-- ✅ **Can't break a build.** A missing tool is *skipped*, not failed. Exit code is
-  `0` by default; `--strict` (opt-in) is the only way it returns non-zero.
-- ✅ **Zero-touch on the scanned project.** Point it at a repo from outside with
-  `--path`; nothing is written into that repo. The only file it ever writes is a
-  report, in an output folder you choose — or nothing at all with `--no-report`.
-
-### The mental model (four ideas explain 90% of it)
-
-| Idea | What it means |
-|---|---|
-| **Read-only** | Runs everything in *check* mode. There is **no** `--fix`/`--write` anywhere. |
-| **Auto-detect** | It only runs a tool that's already installed. A missing tool becomes `SKIP`, never an error. A repo with no Python tools simply shows every Python row as `SKIP`. |
-| **Scoped by default** | With no flags it scans **only the files that changed** vs your base branch (`origin/main`, `main`, …) — you see issues in *new* code, not a wall of legacy noise ("clean as you code"). |
-| **New vs pre-existing** | Inside those files, every finding is classified: on a line **you changed** = *new* (counts); anywhere else = *pre-existing* (listed as info, never blamed on you). |
-| **AI is diff-based** | The Claude review only runs on a diff — split into per-file parts so even a 600-file branch gets reviewed. `--all` disables AI on purpose. |
-
-> The everyday use case: run it with **no flags** on a repo you're actively working
-> in, right before you commit or open a PR. You get a short list of issues **in the
-> code you just wrote**, plus an AI review of your diff.
+- ✅ **Never edits, formats or fixes your code.** Every tool runs in check-only
+  mode (`ruff check --no-fix`, `prettier --list-different`, `pnpm audit`,
+  `gitleaks git`, …). `tsc` runs with `--incremental false`, so it can't drop a
+  `.tsbuildinfo` into your repo.
+- ✅ **Never changes git state.** No add, commit, push, checkout or worktree.
+- ✅ **Never installs anything.** It runs only the tools a project already has.
+  The impact analysis borrows the project's own `typescript` package.
+- ✅ **The AI gets no tools.** Through the SDK, a call is a plain
+  `messages.create` with no tools defined. Through the CLI, `claude -p` runs
+  with `--tools "" --restricted --strict-mcp-config` in an empty temp folder.
+  Either way it can't read, write or run anything; it only sees the packets the
+  tool built.
+- ✅ **Writes nothing outside the reports and caches.** Besides the reports, the
+  only writes are the review cache (`~/.cache/marketink-quality-gate`) and, in
+  CI, the Actions caches. None of them are in the repo.
+- ✅ **Can't break a build unless you ask it to.** A missing tool is `SKIP`.
+  Exit code is `0` unless the gate configured with `--fail-on` / `gate.fail_on`
+  is hit.
+- ✅ **Zero-touch on the scanned project.** The only files it writes are the
+  reports (Markdown, JSON, SARIF) in the folder you choose, or none with
+  `--no-report`.
 
 ---
 
-## 2. Features — what it runs
+## 2. How it fits together
+
+```
+                       ┌──────────────── org: marketink/quality-gate (tag v2) ────────────────┐
+                       │  scan.js · lib/impact.js · rules/catalog.json · baselines/marketink   │
+                       │  .github/workflows/quality-gate.yml  (reusable workflow)              │
+                       └───────────────────────────────┬───────────────────────────────────────┘
+                                                       │ extends / uses @v2
+                ┌──────────────────────────────────────┴───────────────────────────────┐
+                │ each project repo                                                     │
+                │   .quality-gate.json        → rules on/off, gate, context files, ...  │
+                │   .github/workflows/quality-gate.yml  → 15 lines calling the org one  │
+                └──────────────────────────────────────┬───────────────────────────────┘
+                                                       │
+   every push ──► deterministic checks on what the push changed ─────────► SARIF + report
+   every PR   ──► deterministic checks on the PR  +  function-level AI review
+                     │
+                     ├─ diff ──► changed functions (parsed with the project's TypeScript)
+                     ├─ impact ─► callers in ANY file · callee signatures · strictNullChecks
+                     ├─ Claude ─► JSON findings, each with a rule id + quoted lines
+                     └─ verify ─► quote exists in the file? location reviewed? rule enabled?
+                                     │                       │
+                                     ▼                       ▼
+                            PR comment + SARIF        merge gate (fail-on)
+```
+
+---
+
+## 3. What it runs
 
 | Check | Tool | Mode | Scope |
 |---|---|---|---|
-| Lint (Python) | `ruff check` | read-only | changed files |
-| Format (Python) | `ruff format --check` | read-only | changed files |
-| Types (Python) | `mypy` | read-only | changed files |
-| Security (Python) | `bandit` | read-only | changed files |
-| Dependencies (Python) | `pip-audit` | read-only | project |
-| Lint (JS/TS) | `eslint` | read-only | changed files |
-| Format (JS/TS) | `prettier --list-different` | read-only, advisory unless enforced | changed files |
-| Types (JS/TS) | `tsc --noEmit` | read-only | project, errors split by changed files |
+| Lint (JS/TS) | `eslint` | read-only, JSON output | changed files |
+| Format (JS/TS) | `prettier --list-different` | read-only; advisory unless enforced | changed files |
+| Types (JS/TS) | `tsc --noEmit --incremental false` | read-only | project; errors split by changed files |
 | Dependencies (JS/TS) | `pnpm` / `yarn` / `bun` / `npm audit` (picked from the lockfile) | read-only | project |
-| Secrets | `gitleaks git` | read-only | **your branch's commits** + working tree (`--all`: full history) |
-| Supabase (RLS/keys/grants) | *built-in* (no tool) | read-only | changed code + `.sql` (RLS state read from all migrations) |
-| AI review | `claude -p` | read-only | the diff, in per-file parts |
+| Lint / format / types / security (Python) | `ruff`, `ruff format --check`, `mypy`, `bandit` | read-only | changed files |
+| Dependencies (Python) | `pip-audit` | read-only | project |
+| Secrets | `gitleaks git` | read-only, secrets never printed | **the change's commits** + working tree (`--all`: full history) |
+| Supabase (RLS / keys / grants) | *built-in* | read-only | changed code + `.sql` (RLS state read from all migrations) |
+| **AI review** | `claude -p` (no tools) | read-only | **changed functions + their callers anywhere** (TS/JS) |
 
-**Built to be trusted on big branches:**
+**Built to be trusted on big repos:**
 
-- **Tool crashes are `ERROR`, never `FINDINGS`.** "Command line is too long",
-  Node out-of-memory, ESLint/Prettier exit code 2, a missing config, or an audit
-  that couldn't run are reported as the tool failing — with the reason.
-- **Long file lists are batched** to stay under the Windows `cmd.exe` 8,191-char
-  limit (a 700-file branch runs ESLint in ~11 batches and merges the results).
-- **JS tools get a bigger heap** (`node_max_old_space_mb`, default 8192) so `tsc`
-  on a large Next.js app doesn't die at Node's 2 GB default.
-- **Only files git tracks are scanned** — `.next/`, `.env.local`, build output and
-  other ignored files never show up.
-
-Deterministic tools own anything mechanical. The AI review is reserved for
-judgment — security, business logic, architecture, performance, maintainability —
-and is **scoped to the diff** and run in an isolated temp directory so it has
-nothing in your project to touch.
-
-> React/Next are just JS/TS to the scanner — ESLint + Prettier + TypeScript cover
-> them. The language the tool is *written in* (Node) is unrelated to the languages
-> it *scans*: it's an orchestrator that shells out to each stack's tools.
+- **A crashed tool is reported as `ERROR`, never `FINDINGS`.** "Command line is
+  too long", Node out-of-memory, exit code 2, a missing config, or an audit that
+  couldn't run all show the tool failing, with the reason.
+- **Long file lists are batched** to stay under the Windows `cmd.exe`
+  8,191-character limit.
+- **JS tools get a bigger heap** (`node_max_old_space_mb`, default 8192).
+- **Only files git tracks are scanned.** `.next/`, `.env.local` and other
+  ignored files never show up, and neither does the gate's own vendored copy
+  (`.quality-gate/`, `.quality-gate-tool/`).
+- **New vs pre-existing.** On a scoped scan, findings on lines you didn't change
+  are listed as info and never blamed on your change (§13).
 
 ---
 
-## 3. Requirements & setup
+## 4. Requirements & setup
 
-**Node.js 18+ and nothing else** (Node 20+ recommended). The scanner is a single
-dependency-free script — `node scan.js` just works, no `npm install`.
+**Node.js 18+** (20+ recommended). No `npm install` for the tool itself.
 
-The actual checks are **optional and auto-detected** — install whichever a project
-uses; the gate runs what's there and skips the rest.
+Checks are optional and auto-detected; install what a project uses:
 
-### The golden rule of where tools live
-
-| Tool type | Where it must be installed | Why |
+| Tool | Where it must live | Why |
 |---|---|---|
-| **Python** (`ruff`, `mypy`, `bandit`, `pip-audit`) | Global or the project's virtualenv (on your `PATH`) | The scanner looks for them on PATH |
-| **JS/TS** (`eslint`, `prettier`, `typescript`) | **Inside the project** as dev deps (`node_modules/.bin`) | The scanner looks in the project's `node_modules` |
-| **`gitleaks`** (secrets) | Global (on your `PATH`) | Works on any project |
-| **`claude`** (AI review) | Global (on your `PATH`) | Optional; if absent, AI step is skipped |
+| `eslint`, `prettier`, `typescript` | **Inside the project** (`devDependencies`) | Read from the project's `node_modules`. `typescript` also powers the AI review's impact analysis |
+| `ruff`, `mypy`, `bandit`, `pip-audit` | On `PATH` (global or venv) | Python projects |
+| `gitleaks` | On `PATH` | Secrets, any project (CI installs it for you) |
+| `claude` (Claude Code CLI) | On `PATH` | AI review. Locally it uses your Claude login; in CI it uses the `ANTHROPIC_API_KEY` secret |
 
 ```bash
-# Python projects (global, or inside the project's venv)
-pip install ruff mypy bandit pip-audit
-
-# JS/TS/React/Next projects — install as dev deps INSIDE the project
-npm install -D eslint prettier typescript
-
-# Secret scanning (one binary, any project)
-winget install gitleaks.gitleaks      # Windows
-brew install gitleaks                 # macOS
-# Linux: download from https://github.com/gitleaks/gitleaks/releases
-
-# AI review (optional): install Claude Code so `claude` is on PATH
+npm install -D eslint prettier typescript      # JS/TS projects, inside the project
+winget install gitleaks.gitleaks               # Windows  (brew install gitleaks on macOS)
+npm install -g @anthropic-ai/claude-code       # AI review
 ```
 
-> You don't need all of these. With **none** installed the scanner still runs,
-> skips everything gracefully, and tells you what to install.
-
-### Make it a one-word command (recommended)
-
-You'll run this constantly, so add an alias.
+### One-word command (recommended)
 
 **Windows (PowerShell `$PROFILE`):**
 ```powershell
 function qg { node E:\MarketInk\Quality_Gate\quality-gate\scan.js @args }
 ```
-
-**macOS / Linux (`~/.bashrc` or `~/.zshrc`):**
+**macOS / Linux:**
 ```bash
 qg() { node /path/to/quality-gate/scan.js "$@"; }
 ```
-
-Reload your shell — now from *any* project you just type `qg`. Wrappers also ship:
-`quality.ps1` on Windows and `./quality` on macOS/Linux (both pass all args through).
+Wrappers also ship: `quality.ps1` (Windows) and `./quality` (macOS/Linux).
 
 ---
 
-## 4. Quick start & daily usage
-
-Run from inside a repo, or point at one with `--path`.
+## 5. Quick start & daily usage
 
 ```bash
-# Scan the changed files in the current repo (+ AI review of the diff):
-node scan.js            # or: qg
-
-# Zero-touch scan of another project (nothing written into it):
-node scan.js --path ../some-service
-
-# Full health check of the whole project (no AI):
-node scan.js --all --no-ai
+qg                       # changed files vs your base branch + AI review of changed functions
+qg --no-ai               # free deterministic checks only
+qg --path ../service     # scan another repo without touching it
+qg --all --no-ai         # whole-project audit
 ```
 
-### Where reports land (the one thing people trip on)
-
-- **`--path`** = the project you *scan* (defaults to the current folder).
-- **Reports are written to the folder you *run the command from*** — as
-  `./quality-reports/` — **not** into the scanned project (unless you `cd` there or
-  pass `--out`).
-
-**Option A — stand inside the project (most intuitive):**
-```powershell
-cd E:\path\to\my-project
-qg      # report → E:\path\to\my-project\quality-reports\latest.md
-```
-
-**Option B — stand in the tool folder, scan from outside (zero-touch):**
-```powershell
-cd E:\MarketInk\Quality_Gate\quality-gate
-node scan.js --path E:\path\to\my-project
-# report → E:\MarketInk\Quality_Gate\quality-gate\quality-reports\latest.md
-```
-
-### The recipes you'll actually use
+**Reports land in the folder you run from** (`./quality-reports/`), not inside
+the scanned project, unless you pass `--out`.
 
 | I want to… | Command |
 |---|---|
-| **Daily driver** — check my changes + AI review | `qg` |
-| Fast check, no AI (offline, just linters) | `qg --no-ai` |
-| Deep review before a big PR (all 6 AI reviewers) | `qg --ai-full` |
-| Check only what's staged (pre-commit) | `qg --staged` |
-| **Whole feature branch vs master** (all its commits) | `git fetch origin` then `qg --base origin/master` |
-| Same, one module at a time | `qg --base origin/master --only src/billing` |
-| **AI-review a big branch one feature at a time** (`Group-Id` trailers) | `qg --base origin/master --plan-groups` (prints the commands) |
-| **AI-review a big branch 10 commits at a time** | `qg --base origin/master --plan-batches 10 --final-state` (prints the commands) |
-| Also count issues that were already there | `qg --base origin/master --include-existing` |
-| Review everything since a release/tag | `qg --base v1.4.0` |
-| Scan a **different** repo, zero-touch | `qg --path ../other-repo` |
-| One-time full audit of a legacy repo (no AI) | `qg --path ../repo --all --no-ai` |
-| Print only, write nothing | `qg --no-report` |
-| CI gate (exit 1 on findings) | `qg --staged --no-ai --strict` |
-| Slow/huge repo | `qg --timeout 1200` |
-| See all options | `qg --help` |
-
-> AI review needs `claude` on PATH and a **diff** — it's skipped on `--all` and on
-> an empty diff. Deterministic checks need their tools installed (§3); missing ones
-> just `SKIP`.
+| **Daily driver**: my changes + AI review | `qg` |
+| Fast, no AI | `qg --no-ai` |
+| Only what's staged | `qg --staged` |
+| A whole feature branch vs master | `git fetch origin` then `qg --base origin/master` |
+| One module at a time | `qg --base origin/master --only src/billing` |
+| Every rule, including the off-by-default ones | `qg --ai-full` |
+| The previous diff-based AI review | `qg --ai-mode diff` |
+| Fail like CI would | `qg --fail-on deterministic` |
+| Also write SARIF | `qg --sarif out/gate.sarif` |
+| Review a big branch per feature (`Group-Id`) | `qg --base origin/master --plan-groups` |
+| Review a big branch 10 commits at a time | `qg --base origin/master --plan-batches 10 --final-state` |
+| Count issues that were already there | `qg --include-existing` |
+| Use another config file | `qg --config path/to/.quality-gate.json` |
 
 ---
 
-## 5. Options / flags
+## 6. Options / flags
 
 ```
 --path PATH          repo to scan (default: current directory)
---all                scan the whole project instead of just changes (disables AI)
+--config FILE        project config (default: <path>/.quality-gate.json, else the
+                     org baseline)
+--all                scan the whole project (disables AI)
 --staged             scan only git-staged changes
---base REF           git base ref for the diff (default: auto-detect origin/HEAD,
-                     origin/main, origin/master…)
---only PATH          limit the scan (files, findings, diff) to a path; repeatable
+--base REF           base ref (default: origin/HEAD, origin/main, origin/master, ...)
+--only PATH          limit files, findings and diff to a path; repeatable
 --include-existing   count findings on lines you did NOT change as well
---range A..B         review only the commits in A..B (B defaults to HEAD)
---final-state        with --range: review the latest version of the files those
-                     commits touched, each file once across batches
---plan-batches N     print the branch split into N-commit batches with token
-                     estimates and ready commands (no scan, no AI calls)
---plan-groups        print the feature groups (Group-Id commit trailer) with token
-                     estimates and ready commands (no scan, no AI calls)
---group ID           review one feature group: its files at their final version,
-                     its full commit messages as claims to verify
+--range A..B         only the commits in A..B (B defaults to HEAD)
+--final-state        with --range: latest version of the files, each file once
+--plan-batches N     print N-commit batches + token estimates (no scan, no AI)
+--plan-groups        print Group-Id feature groups + estimates (no scan, no AI)
+--group ID           review one feature group
 --no-ai              skip the AI review
---ai-only            skip the deterministic checks; run only the AI review
---ai-full            run all 6 specialized AI reviewers (review/security/architecture/
-                     performance/business-logic/supabase)
---ai-max-chunks N    max diff parts per AI reviewer (default 10; each = 1 claude call)
---no-report          print to the console only; write no files anywhere
---out DIR            report output directory (default: ./quality-reports)
---strict             exit 1 if any NEW findings (for optional CI gating)
---timeout SEC        per-tool timeout (default: 600)
+--ai-only            skip deterministic checks; AI review only
+--ai-mode MODE       functions (default) | diff (previous diff-based review)
+--ai-full            functions mode: enable every rule; diff mode: 6 reviewers
+--ai-max-chunks N    max AI calls per reviewer (default 10)
+--fail-on LEVEL      none | deterministic | blocking | any  (exit 1 when hit)
+--strict             same as --fail-on deterministic
+--ai-backend B       auto (default) | sdk (Anthropic SDK + API key) | cli (claude CLI)
+--ai-batch           send the AI review through the Batches API (-50%, slower)
+--no-cache           don't reuse cached per-function reviews
+--cache-dir DIR      review cache folder (default ~/.cache/marketink-quality-gate)
+--rule-stats FILE    per-rule precision (from lib/feedback.js); demotes weak rules
+--sarif FILE         also write SARIF 2.1.0 to FILE
+--no-report          print only; write no files
+--out DIR            report directory (default: ./quality-reports)
+--timeout SEC        per-tool timeout (default 600)
 ```
 
-**How scope is decided:**
-- In a git repo it scans **changed files vs the base branch** by default
-  (auto-detects `origin/HEAD` → `origin/main` → `origin/master` → `main` →
-  `master`). The diff is taken from the **fork point** (`git merge-base`) to your
-  working tree, so it covers every commit on the branch plus uncommitted and
-  untracked work — and ignores commits that landed on master after you branched.
-- `--all` scans everything git tracks; `--staged` scans staged changes only.
-- Not a git repo? It automatically falls back to `--all`.
+**Exit codes:** `0` = ran and the gate passed (or no gate). `1` = the
+`--fail-on` gate was hit. `2` = bad input: a missing path, a missing `--base`
+ref (`git fetch origin` usually fixes it), an invalid flag value, or a broken
+config file.
 
-**How "new" is decided (the baseline):**
-- Line-level tools (ESLint, Ruff, Bandit, Supabase, Prettier): a finding is
-  **new** if it sits on a line you added/changed. Moved-but-unchanged files are
-  pre-existing.
-- Cross-file tools (`tsc`, `mypy`): **new** if it's in a file you changed. Errors
-  in untouched files are listed separately — usually pre-existing, but a changed
-  signature can break an untouched caller, so they're shown, not hidden.
-- Dependency audit: **new** only if the lockfile or a `package.json` dependency
-  field changed; otherwise every advisory already exists on the base branch.
-- Secrets (gitleaks): only the branch's commits and your working tree are scanned,
-  so everything it reports was introduced by the change.
-- `--include-existing` turns all of this off and counts everything.
+---
 
-**Big branches & the AI review:** the diff is split per file into ~60k-char parts
-(source code first, lockfiles/minified/binary left out) and each part is reviewed
-separately. With the default cap of 10 parts, a very large branch may be only
-partly reviewed — the report's **coverage** entry lists every file that wasn't, so
-raise `--ai-max-chunks` or review module by module with `--only`.
+## 7. The AI review: changed functions, verified evidence
 
-### Reviewing a big branch by feature (recommended): `Group-Id` trailers
+### Why it works this way
 
-A branch usually holds several features whose commits interleave (feature A in
-commits 10 and 12, feature B in 11). Fixed-size batches cut features in half.
-Instead, tag each commit with a git trailer naming its feature:
+A reviewer that reads only diff hunks has to guess: it can't see the guard two
+files away, the test setup that blocks the network, or the DB default that
+fixes the "bug". The function review removes the guessing in three steps:
 
-```
-Inbox 5i: window escape hatch
+1. **The tool computes the facts.** `lib/impact.js` loads the project's own
+   `typescript` package (in a child process with its own heap) and, for every
+   changed TS/JS file:
+   - maps each changed line to the **function** it belongs to (methods, arrow
+     functions, React components, nested functions; the outermost one under
+     `max_body_lines`);
+   - takes the **new body** (line-numbered) and the **old body**;
+   - finds **every caller in the whole project**, including files that aren't
+     in the diff, with a few lines of context each;
+   - resolves the **signatures of everything it calls** (so `T | null` returns
+     are visible);
+   - reads the compiler settings (e.g. **strictNullChecks ON/OFF**) and states
+     them as facts.
+2. **Claude checks those facts against a fixed list.** It gets the packets, the
+   [rule catalog](#8-rule-catalog), the project's `CLAUDE.md`/`AGENTS.md` (as
+   authoritative decisions) and the commit subjects (as intent only). It must
+   answer in JSON (`--json-schema`). Every finding needs a **rule id**, a
+   **location in the packets**, a **concrete failure scenario** and **quoted
+   evidence**. Anything it can't decide from the code shown goes into
+   **Questions**, not findings.
+3. **The tool verifies before it reports.** A finding is **rejected** when:
+   - its rule isn't enabled for this project;
+   - its `file:line` isn't inside the code that was reviewed (a changed function
+     or a caller snippet);
+   - **any** quoted line doesn't exist in the real file within ±3 lines of the
+     cited line. A quote can also be a resolved callee signature, which is a
+     compiler fact;
+   - it has no quote anchored to a real code line.
 
-...message body: intent, invariants, fixes...
+   Rejected findings are listed (collapsed) in the report with the reason, so
+   you can see what was filtered out.
 
-Group-Id: conversations-inbox
-```
+### What it will and won't report
 
-Then review **one feature per run**, whatever its position in history:
-
-```powershell
-git fetch origin
-qg --base origin/master --plan-groups                       # groups, files, ~tokens, warnings, commands
-qg --base origin/master --no-ai --out quality-reports/branch  # free checks, once
-qg --base origin/master --group conversations-inbox --ai-only --out quality-reports/group-conversations-inbox
-```
-
-**What one `--group` run sends to the AI:**
-- **Only that feature's files**, at their final version. Each file appears once,
-  and no other feature's files are mixed in.
-- **The group's full commit messages**, oldest first (up to
-  `group_message_chars`). The reviewer is told to check every concrete claim in
-  them against the code: "the worker now imports it", "inserted oldest-first +
-  resume token", "the client is told what it may do". It reports claims the code
-  contradicts, and lists those it can't confirm. Quoted tool results such as
-  `tsc 0` are skipped.
-- **Shared files**, i.e. files also changed by other groups, listed by name with
-  those groups. Their diff may contain other features' hunks, and the reviewer is
-  told to judge them only against this group's commits.
-- **A manifest** when a group needs several parts: each part lists which files
-  the other parts cover, so the reviewer knows what's missing instead of
-  guessing.
-
-**Edge cases:**
-- **No trailer:** commits are grouped by shared files (`ungrouped-1`, …), ignoring
-  hub files like `package.json`, lockfiles, `group_hub_files`, and anything
-  touched by more than 30% of commits. The plan lists every such commit so you
-  can see it.
-- **Merge commits:** never mixed into feature groups. A merge group is reviewed
-  with `git show --remerge-diff`, which shows only the conflict resolutions; clean
-  merges cost nothing.
-- **A commit in two features:** `Group-Id: billing, inbox` puts it in both.
-- **Gitleaks** scans only the group's commits; **linters** check the group's files
-  (or run them once for the branch and use `--ai-only`).
-- **Warnings in the plan:** commits without a trailer, single-commit groups
-  (possible typo), files changed by 3+ groups, and groups that exceed
-  `ai_max_chunks`.
-
-### Reviewing a big branch in batches (e.g. 50 commits, 10 at a time)
-
-Use this when commits have no `Group-Id` trailer, or when you want to review
-history in order.
-
-The deterministic checks cost no tokens — run them **once** for the whole branch.
-Spend AI tokens batch by batch, reading each report before starting the next.
-
-```powershell
-git fetch origin
-# 1. See the plan: batches, files, ~tokens each, and the exact commands. No AI calls.
-qg --base origin/master --plan-batches 10 --final-state
-
-# 2. Free checks once for the whole branch
-qg --base origin/master --no-ai --out quality-reports/branch
-
-# 3. AI review one batch at a time (commands are printed by step 1)
-qg --base origin/master --range <fork>..<c10> --final-state --ai-only --out quality-reports/batch-01
-qg --base origin/master --range <c10>..<c20> --final-state --ai-only --out quality-reports/batch-02
-...
-```
-
-**Literal ranges vs `--final-state`.**
-
-| | `--range A..B` (literal) | `--range A..B --final-state` |
-|---|---|---|
-| The AI reads | exactly what those commits changed | the **latest** version of the files those commits touched |
-| A file edited in commits 3, 18 and 41 | reviewed 3 times, twice in versions that no longer exist | reviewed **once**, in the first batch that touched it, as it is now |
-| Total tokens | higher (repeats + stale code) | ≈ one whole-branch review, just split up |
-| Use it to | review history commit-group by commit-group, like a PR series | check the branch's end result in pieces you can manage |
-
-For a "can this merge?" review, use `--final-state`.
-
-**What a batch run does:**
-- **AI**: one call per ~60k-char part, with the batch's commit subjects added as
-  context (`ai_commit_context`).
-- **Gitleaks**: only that batch's commits (`--log-opts=A..B`).
-- **Linters** (when not `--ai-only`): the files that batch touched, as they are
-  now. "New" means new in the branch, because the tools read your current
-  files, not old commits.
-- **Reports** are named `report-<time>-range-<from>-<to>.md`. Use `--out` per
-  batch so the `latest.md` files don't overwrite each other.
-
-**Ways to cut tokens** (`quality-gate.config.json`, AI only; linters still scan
-everything):
-
-| Setting | Effect |
+| ✅ Reports (with proof) | ❌ Never reports |
 |---|---|
-| `"ai_exclude": ["docs/**", "*.md", "**/__snapshots__/**"]` | Files the AI never reads |
-| `"ai_context_lines": 1` | 1 unchanged line around each change instead of 3 |
-| `"ai_ignore_whitespace": true` | Drops whitespace-only changes (great after a reformat; keep off for Python/YAML) |
-| `--only src/billing` | Review one module per run |
-| `"ai_chunk_chars": 120000` | Fewer, larger parts. Every `claude -p` call carries a fixed ~25k tokens of Claude Code overhead (~9k cache write + ~16k cache read, ~$0.07 measured), so halving the number of calls saves real usage on big branches |
-| always on | Deleted files send only their name, moved files only the rename, and lockfiles, minified, maps and binaries are left out |
+| A caller in an untouched file that now dereferences a `null` the change introduced | "This business flow might be wrong" |
+| `{ data, error }` used without checking `error` | Naming, formatting, comments, style |
+| A promise that isn't awaited where the result matters | Test hygiene, refactors no rule asks for |
+| A retry path that can send a message twice | Decisions documented in `CLAUDE.md` / context files |
+| An `await` inside a loop over a large collection | Anything it can't quote |
 
-**Exit codes:** `0` = ran fine (even with findings). `1` = only with `--strict`
-*and* there were new findings. `2` = bad `--path` or a `--base` ref that doesn't
-exist (`git fetch origin` usually fixes it). That's why it's safe in CI by
-default — it can't fail your build unless you opt in with `--strict`.
+### Example (from the test suite)
 
----
+`findUser()` was changed to return `null` instead of throwing. `src/ui/banner.ts`
+was **not in the diff**, but impact analysis found it as a caller:
 
-## 6. Reading the report
+```
+#### [MEDIUM] NULL-02 — greeting reads .name on findUser's result, which can now be null
+src/ui/banner.ts:4 in greeting · Caller does not handle a null the changed function can now return
+Evidence (verified against the file):
+- src/lib/users.ts:7 — if (!u) return null;
+- src/ui/banner.ts:4 — return "Hi " + findUser(id).name;
+```
 
-Every run writes three files into `quality-reports/`:
+### Coverage & limits
+- **Language:** TS/JS (`.ts .tsx .js .jsx .mjs .cjs`). If the project has no
+  `typescript` in `node_modules`, the review falls back to the diff-based review
+  (`--ai-mode diff`) and says so.
+- **Skipped by default:** tests, mocks, stories, `.d.ts`, e2e (`review.skip_paths`).
+  The deterministic checks still scan them.
+- **Big changes:** at most `max_functions` (80) functions and `ai_max_chunks`
+  (10) calls per run; anything over is listed in the report's notes.
+- **Callers:** up to `max_callers` (8) per function are shown; the total count is
+  always given.
+- **Monorepos:** each changed file uses its nearest `tsconfig.json` /
+  `jsconfig.json`.
+- **Not yet:** the AI review only runs on scoped scans (not `--all`), and
+  Python files only get the diff-based review.
 
-- **`latest.md`** — human-readable. **Read this one.**
-- **`latest.json`** — same data, machine-readable (`{ meta, checks, reviews }`), for
-  dashboards/automation.
-- **`report-YYYYMMDD-HHMMSS.md`** — timestamped history, one per run.
+**Risk ordering.** Functions are reviewed riskiest first. Risk goes up with:
+- callers outside the diff;
+- being exported;
+- living in API, worker, lib, db or auth paths;
+- being modified rather than new;
+- the size of the change.
 
-Each check has a status:
+When a call cap or the token budget is hit, it's the lower-risk functions that
+get skipped, and the report lists them.
 
-| Status | Meaning | What to do |
-|---|---|---|
-| **PASS** | Tool ran, found nothing | 🎉 Nothing to do |
-| **FINDINGS** | Tool ran, found issues **your change introduced** | Read the **Details** section and fix them |
-| **INFO** | Only pre-existing issues, warnings, low-severity notes, or an advisory check (e.g. an unenforced formatter) | Nothing blocks; worth a look when you touch that code |
-| **SKIP** | Tool not installed, or nothing in scope | Install the tool (§3) if you want that check |
-| **ERROR** | The *tool* failed (crash, OOM, timeout, missing config/lockfile) — not your code | See §10 |
-| **OFF** | Disabled in config | You turned it off in `quality-gate.config.json` |
-
-- The **Details** section lists `FINDINGS` and `ERROR` checks, each with the
-  command it ran. Findings are grouped as **New in this change** and
-  **Pre-existing**. `INFO` checks sit in a collapsed section below.
-- Skipped checks are folded into one line (e.g. the Python tools on a JS repo).
-- Secrets are **never printed** — only rule, file, line, commit and the length.
-- **AI usage** — every `claude` call is run with `--output-format json`, and the
-  report has a per-call table (input, cache write, cache read, output, total,
-  time) with totals. The same data is in `latest.json` → `meta.ai_usage` and each
-  review's `usage`, and the console prints it live after each call. The `~USD`
-  column is the API list-price equivalent; on a Pro/Max/Team/Enterprise login the
-  calls count against your plan's usage limits instead. (An older `claude` CLI
-  without `--output-format` falls back to plain text with no usage.)
-- The **AI Review** section is Claude's prose analysis of your diff: each issue gets
-  a `file:line` estimate, a severity (high/med/low), the problem in one sentence,
-  and a concrete fix. If it found nothing, it says so.
-
-> A `SKIP` or `ERROR` never means the scanner failed — it means a *tool* was missing
-> or a *project* has a gap. The scanner cannot break your build and made no changes.
+**Type errors in impacted callers count.** If `tsc` (or `mypy`) reports an
+error in a file that **calls a changed function**, that error is counted as
+**new**, even though the file is outside the diff. A changed return type that
+breaks an untouched caller fails `--fail-on deterministic`. This also works with
+`--no-ai`: the impact analysis runs on its own whenever `tsc` has errors outside
+the changed files (`review.impact_for_types`).
 
 ---
 
-## 7. Configuration
+## 8. Rule catalog
 
-There are two layers:
+`rules/catalog.json` (version `1.0.0`). The reviewer may report **only** these
+ids. Projects can switch rules or whole groups on or off, and add their own
+(§9).
 
-1. **The scanner's own config** — `quality-gate.config.json` (optional).
-2. **Each tool's own config** — the normal `ruff`, `eslint`, `tsconfig`, etc. files
-   in the project. The gate just *runs* these; it respects the project's existing
-   rules and never invents its own.
+| Id | Group | Default severity | What it catches |
+|---|---|---|---|
+| NULL-01 | null-safety | medium | A value the packet shows can be null/undefined is dereferenced without a guard |
+| NULL-02 | null-safety | high | A caller doesn't handle a null/partial result the changed function can now return |
+| ERR-01 | errors | medium | Error swallowed: catch ignores/only logs and continues as success |
+| ERR-02 | errors | high | A returned error (`{ data, error }`, `{ ok:false }`, non-2xx) is ignored and data used |
+| ERR-03 | errors | medium | Throw vs return-error contract changed under callers |
+| ASYNC-01 | async | high | Missing `await` where the result, ordering or failure matters |
+| ASYNC-02 | async | medium | Floating promise / unhandled rejection |
+| ASYNC-03 | async | medium | Stale state used after an `await` (wrong target after a concurrent change) |
+| CONTRACT-01 | contracts | high | Call doesn't match the (changed) signature or return shape |
+| CONTRACT-02 | contracts | medium | New behaviour contradicts an assumption a caller visibly relies on |
+| FLOW-01 | flow | medium | Inverted/incomplete condition, unreachable branch, unhandled state |
+| FLOW-02 | flow | high | Early exit skips cleanup / a status update (e.g. stuck in "sending") |
+| FLOW-03 | flow | high | Side effect can run twice on retry / redelivery / double submit |
+| FLOW-04 | flow | medium | Off-by-one / boundary / empty-first-last case |
+| PERF-01 | performance | medium | Sequential I/O inside a loop over a large collection |
+| PERF-02 | performance | low | Repeated expensive work that can be hoisted or memoized |
+| QUALITY-01 | quality | low | Re-implements logic an existing function in the packet already provides |
+| QUALITY-02 | quality | low | **Off by default.** Function mixes responsibilities in a way that makes a named bug likely |
+| QUALITY-03 | quality | low | Dead code introduced |
+| SEC-01 | security | high | Untrusted input reaches a query / HTML / shell / path / redirect unvalidated |
+| SEC-02 | security | high | Handler reads/writes by id without the auth check its siblings do |
+| SEC-03 | security | medium | Secrets / tokens / personal data in logs, errors or responses |
 
-### `quality-gate.config.json`
+**Severity:** high = data loss, wrong data written, security, crash in a common
+path; medium = wrong behaviour in a realistic edge case; low = minor and
+contained. Only findings at or above `review.min_severity` (default `medium`)
+go to the PR comment, SARIF and the gate. Lower ones are listed as "minor" in
+the report.
 
-Lives next to `scan.js`. Delete it and safe defaults still apply.
+**Changing the catalog** is an org decision: edit `rules/catalog.json` by PR,
+bump its `version`, and tag a new tool release.
+
+---
+
+## 9. Configuration: org baseline + project `.quality-gate.json`
+
+### Layering
+
+```
+built-in defaults
+  └─ baselines/marketink.json          org baseline (in this repo, versioned by tag)
+       └─ <project>/.quality-gate.json  "extends": "marketink"  + project overrides
+            └─ --config FILE            (optional; replaces the project file)
+                 └─ CLI flags           (--fail-on, --ai-mode, --base, ...)
+```
+
+- **Objects merge key by key; arrays and scalars replace.** For example, a
+  project's `review.skip_paths` replaces the baseline list.
+- **No `.quality-gate.json`?** The org baseline applies as-is.
+- **Comments:** keys starting with `_` are ignored. Unknown keys print a
+  "typo?" warning.
+- **`extends`** takes a baseline name (`"marketink"` → `baselines/marketink.json`)
+  or a relative path (`"../shared/qg.json"`). Chains up to 5 deep are allowed.
+- **The report shows which files were used:** `Config: quality-gate/baselines/marketink.json → .quality-gate.json`.
+- The pre-2.0 `quality-gate.config.json` next to `scan.js` is still read (lowest
+  priority) with a deprecation warning.
+
+### Project file example (`examples/quality-gate.json`)
 
 ```json
 {
-  "base_ref": null,
+  "extends": "marketink",
   "disabled_checks": [],
-  "node_max_old_space_mb": 8192,
-  "format_checks": "auto",
-  "ai_max_chunks": 10,
-  "ai_chunk_chars": 60000
+  "gate": { "fail_on": "deterministic", "ai_blocking_rules": [] },
+  "review": {
+    "rules": {
+      "disable": [],
+      "enable": [],
+      "custom": [
+        { "id": "PRJ-01", "title": "Supabase query result not checked",
+          "check": "A supabase-js call's { error } is ignored and its data is used.",
+          "severity": "high" }
+      ]
+    },
+    "context_files": ["CLAUDE.md", "docs/decisions.md"],
+    "min_severity": "medium"
+  }
 }
 ```
 
-- **`base_ref`** — default git ref to diff against. `null` = auto-detect
-  (`origin/main` → `main` → …). Set it if your default branch is unusual (e.g.
-  `"origin/develop"`).
-- **`disabled_checks`** — check ids you never want to run. Valid ids: `ruff`,
-  `ruff-format`, `mypy`, `bandit`, `pip-audit`, `eslint`, `prettier`, `tsc`,
-  `npm-audit`, `gitleaks`, `supabase`. Example — silence npm audit and secrets:
-  `["npm-audit", "gitleaks"]`. (`npm-audit` is the id for the JS dependency audit
-  whichever package manager runs it.)
-- **`node_max_old_space_mb`** — heap given to eslint/prettier/tsc (via
-  `NODE_OPTIONS`). Raise it if `tsc` reports "Node ran out of memory".
-- **`format_checks`** — `"auto"` (default): Prettier/ruff-format are findings
-  only if the project *enforces* them (lint-staged, a husky/lefthook/pre-commit
-  hook, a CI workflow, or `eslint-plugin-prettier`); otherwise advisory `INFO`.
-  `"enforce"` / `"advisory"` force one or the other.
-- **`ai_max_chunks`** / **`ai_chunk_chars`** — how many diff parts (and how large)
-  each AI reviewer gets.
-- **`ai_exclude`**, **`ai_context_lines`**, **`ai_ignore_whitespace`**,
-  **`ai_commit_context`** — trim what the AI reads (see *Reviewing a big branch
-  in batches* in §5).
-- **`group_trailer`** (default `Group-Id`), **`group_message_chars`** (8000),
-  **`group_hub_files`** — feature-group review (see *Reviewing a big branch by
-  feature* in §5).
+### Key reference
 
-### Give Claude your project's rules — `CLAUDE.md`
+**Top level**
 
-The highest-leverage config for context-aware review. Drop a `CLAUDE.md` at the
-project root and the AI review treats its rules as the standard it reviews against.
-A template ships with the tool:
+| Key | Default (baseline) | Meaning |
+|---|---|---|
+| `extends` | — | Baseline name or relative path to inherit from |
+| `base_ref` | `null` | Base ref for scoped scans; `null` = auto-detect |
+| `disabled_checks` | `[]` | Check ids never to run: `eslint prettier tsc npm-audit gitleaks supabase ruff ruff-format mypy bandit pip-audit` |
+| `node_max_old_space_mb` | `8192` | Heap for eslint/prettier/tsc **and the impact analysis** |
+| `format_checks` | `"auto"` | `auto`: formatter findings only if a hook/CI/lint-staged enforces it; `enforce`; `advisory` |
 
-```bash
-cp quality-gate/.quality/standards/CLAUDE.template.md  <your-project>/CLAUDE.md
-```
+**`gate`** (see §11)
 
-Fill in your stack, architecture rules, API conventions, and security rules as
-concrete "always/never" statements, e.g.:
+| Key | Default | Meaning |
+|---|---|---|
+| `gate.fail_on` | `"none"` | `none` / `deterministic` / `blocking` / `any` |
+| `gate.ai_blocking_rules` | `[]` | AI rule ids that fail the gate under `blocking` (e.g. `["FLOW-03","SEC-01"]`) |
 
-```
-- Never access the database directly from controllers. Always go through the service layer.
-- Never build SQL by string concatenation — use parameterized queries.
-- Every API endpoint validates its input before use.
-- Never log secrets, tokens, or PII.
-```
+**`review`** (function-level AI review)
 
-The more concrete the rules, the more objective and useful the AI review.
+| Key | Default | Meaning |
+|---|---|---|
+| `review.mode` | `"functions"` | `functions` or `diff` (previous diff-based review) |
+| `review.model` | `null` | Model passed to `claude --model` (null = the CLI's default) |
+| `review.rules.enable` | `[]` | Extra rule ids **or groups** to turn on (e.g. `"QUALITY-02"`) |
+| `review.rules.disable` | `[]` | Rule ids or groups to turn off (e.g. `"performance"`) |
+| `review.rules.custom` | `[]` | Project rules: `{ "id", "title", "check", "severity" }` |
+| `review.context_files` | `["CLAUDE.md","AGENTS.md"]` | Project files sent as authoritative context (decisions aren't bugs) |
+| `review.context_chars` | `12000` | Max characters of context files per call |
+| `review.skip_paths` | tests, mocks, stories, e2e, `.d.ts` | Globs never sent to the AI review |
+| `review.max_functions` | `80` | Max functions reviewed per run |
+| `review.max_callers` | `8` | Caller snippets shown per function |
+| `review.max_callees` | `20` | Callee signatures shown per function |
+| `review.max_body_lines` | `200` | Longer functions are sent as excerpts around the changed lines |
+| `review.caller_context_lines` | `4` | Lines of context around each call site |
+| `review.min_severity` | `"medium"` | Lowest severity that reaches the PR comment, SARIF and the gate |
+| `review.timeout_sec` | `600` | Per-call timeout |
+| `review.backend` | `"auto"` | `auto`: SDK when `ANTHROPIC_API_KEY` + `@anthropic-ai/sdk` are available, else the `claude` CLI · `sdk` · `cli` (§19) |
+| `review.effort` | `"high"` | SDK only: `low` / `medium` / `high` / `xhigh` / `max`. Lower is cheaper |
+| `review.fallbacks` | `true` | SDK only: server-side refusal fallbacks (`fallbacks: "default"`) |
+| `review.concurrency` | `4` | SDK only: parallel calls |
+| `review.batch` | `"never"` | `never` / `auto` (Batches API when ≥ `batch_min_calls` calls) / `always` |
+| `review.batch_min_calls` / `batch_wait_sec` | `6` / `1800` | Batch threshold; how long to wait for a batch |
+| `review.cache` / `cache_dir` / `cache_days` | `true` / `~/.cache/marketink-quality-gate` / `30` | Per-function review cache (§19) |
+| `review.max_input_tokens` | `400000` | Per-run input-token budget; lowest-risk functions are skipped beyond it |
+| `review.rule_stats` | `null` | Path to a precision file (CI passes it automatically, §20) |
+| `review.precision` | `{min_samples:10, demote_below:0.5, promote_above:0.85}` | When a rule is demoted / marked eligible to block |
+| `review.impact_for_types` | `true` | Count `tsc`/`mypy` errors in callers of changed functions as new |
+
+**AI sizing and big-branch keys** (both modes)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ai_max_chunks` | `10` | Max AI calls per run |
+| `ai_chunk_chars` | `60000` | Max characters of packets/diff per call |
+| `ai_exclude` | `[]` | Globs the diff-mode AI never reads |
+| `ai_context_lines` | `3` | Diff context lines (diff mode) |
+| `ai_ignore_whitespace` | `false` | Drop whitespace-only changes (diff mode) |
+| `ai_commit_context` | `true` | Send commit subjects as intent |
+| `group_trailer` | `"Group-Id"` | Commit trailer naming a feature group (§13) |
+| `group_message_chars` | `8000` | Commit-message budget per group (diff mode) |
+| `group_hub_files` | `[]` | Globs that never link unlabelled commits |
+
+### `CLAUDE.md`: the project's decisions
+
+`CLAUDE.md` (and anything in `review.context_files`) is sent to the reviewer as
+**authoritative**: documented decisions are intentional and are not reported as
+problems. Keep it to concrete "always/never" rules and decisions, for example
+"D-24: media-upload.ts uses the system upload path by design". A template ships
+at `.quality/standards/CLAUDE.template.md`.
 
 ---
 
-## 8. Supabase checks
+## 10. CI/CD with GitHub Actions
 
-Many of our projects use Supabase, where **Row Level Security (RLS) is the main
-access control** — every `public` table is exposed over an auto-generated REST API,
-and the `service_role` key bypasses RLS entirely. Generic linters know none of
-this, so the gate ships a **built-in Supabase check** plus a **Supabase AI
-reviewer**. Nothing to install; it auto-detects Supabase (a `supabase/` dir,
-`@supabase/*` in `package.json`, or `supabase`/`createClient` in the scanned code)
-and shows `SKIP` on projects that don't use it.
+### Set up a project (once)
 
-**Deterministic check (`supabase`)** — concrete "always/never" signatures scanned
-over changed code + `.sql` migrations:
+1. **Add the workflows.** Copy `examples/github/quality-gate.yml` to
+   `.github/workflows/quality-gate.yml` in the project. Also copy
+   `examples/github/quality-gate-feedback.yml`, the weekly precision job (§20).
+   The main one:
+   ```yaml
+   on: [push, pull_request]
+   jobs:
+     quality-gate:
+       uses: sarthakkk1212/quality-gate/.github/workflows/quality-gate.yml@v2
+       permissions: { contents: read, pull-requests: write, security-events: write }
+       with: { tool-ref: v2, ai: pull_request }
+       secrets:
+         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+   ```
+2. **Add the config.** Copy `examples/quality-gate.json` to `.quality-gate.json`
+   and adjust it.
+3. **Secrets.** Add `ANTHROPIC_API_KEY` as an **org secret** (CI can't use a
+   Claude Team/Pro login; it bills per token to the org API account). Without it
+   the AI review is skipped and everything else still runs. If the
+   quality-gate repo is private, also add `QUALITY_GATE_TOKEN` (a token that can
+   read it).
+4. **Repo settings.** Actions → General → Workflow permissions → **Read and
+   write** (for the PR comment). SARIF upload needs code scanning, which on
+   private repos requires GitHub Advanced Security; without it that step is
+   skipped and nothing else fails.
 
-| It flags | Severity | Why |
+### What runs when
+
+| Event | Base | Deterministic checks | AI review |
+|---|---|---|---|
+| `push` (any branch) | the push's previous commit (`github.event.before`), else the default branch | ✅ on what this push changed | ❌ (unless `ai: always`) |
+| `pull_request` (opened / updated) | `origin/<PR base branch>` | ✅ on the whole PR | ✅ changed functions + callers |
+
+On PRs with the AI review, the job also:
+- installs `@anthropic-ai/sdk` **into the tool folder** (never the project) and
+  calls Claude through it (`--ai-backend sdk`);
+- restores and saves the **per-function review cache** (`actions/cache`, keyed
+  per branch), so each new push pays only for changed functions;
+- restores the latest **rule-precision stats** written by the feedback workflow
+  and passes them with `--rule-stats`;
+- posts each verified AI finding as an **inline review comment** asking for
+  👍/👎 (deduplicated by fingerprint across pushes).
+
+Every run:
+- uploads **SARIF**: findings appear inline on the PR diff and in Security →
+  Code scanning, matched across runs by stable fingerprints;
+- uploads the **report artifact** (`latest.md`, `latest.json`, `latest.sarif`);
+- **comments on the PR** once and updates the same comment on each run (gate
+  verdict, check table, top AI findings, token usage);
+- **enforces the gate last**, after the uploads, so a failed gate still leaves
+  the full report.
+
+### Reusable workflow inputs
+
+| Input | Default | Meaning |
 |---|---|---|
-| `service_role`/secret key behind a browser-exposed env var (`NEXT_PUBLIC_`, `VITE_`, `REACT_APP_`, …) | HIGH | Ships full-DB-access credentials to the client |
-| A hardcoded secret key (`sb_secret_…`) | HIGH | Leaks a key that bypasses RLS |
-| A hardcoded JWT whose payload says `"role": "service_role"` (decoded — the variable name doesn't matter; project ref + expiry shown) | HIGH | Leaks a key that bypasses RLS |
-| `service_role` referenced in a client (`'use client'`) file | HIGH | The service role must never reach the browser |
-| `alter table … disable row level security` | HIGH | Table becomes fully readable/writable with the anon key |
-| `create table` in the **public** schema that **no migration** ever enables RLS on | MEDIUM | New table left unprotected |
-| `grant <write> … to anon`/`public` | MEDIUM | Exposes data via the REST API; prefer RLS policies |
-| `grant <read>/execute … to anon`/`public` | LOW | Readable / RPC-callable by anyone — make sure RLS or the function checks auth |
-| A policy whose `TO` clause (or `USING`) targets `service_role` | LOW | Redundant (service_role already bypasses RLS) — harmless, safe to drop |
+| `tool-ref` | `v2` | Tool version (tag) to run. Keep it equal to the `@v2` in `uses:` |
+| `tool-repo` | `sarthakkk1212/quality-gate` | Where the tool lives |
+| `base` | auto | Override the base ref |
+| `ai` | `pull_request` | `never` / `pull_request` / `always` |
+| `fail-on` | from `.quality-gate.json` | `none` / `deterministic` / `blocking` / `any` |
+| `working-directory` | `.` | Project folder (monorepos) |
+| `node-version` | `20` | Node for the tool and the project's tools |
+| `gitleaks-version` | `8.30.1` | Gitleaks release installed on the runner |
+| `upload-sarif` | `true` | Upload to code scanning |
+| `comment` | `true` | Post / update the PR comment |
+| `inline-comments` | `true` | Post each verified AI finding inline with a 👍/👎 request |
+| `ai-batch` | `false` | Use the Batches API (half price, slower) |
+
+The job installs the project's dependencies from its lockfile (pnpm, yarn or
+npm), so `eslint`/`prettier`/`typescript` come from the project itself.
+
+### Cost in CI
+
+See §19 for all the cost controls. In short:
+- **Deterministic checks:** free.
+- **AI review:** a measured 2-function change took **~8k tokens (~$0.04–0.09)**.
+  A re-push with no change to those functions costs **0 tokens** (cache hit).
+- **Real numbers:** `latest.json → meta.ai_usage` and the PR comment show the
+  actual tokens and estimated cost of every run.
+- **`concurrency: cancel-in-progress`** in the example caller stops paying for
+  runs that a newer push replaced.
+
+### Recommended rollout
+1. **Week 1–2:** `fail_on: "none"`. Watch the PR comments and the
+   rejected-by-evidence counts.
+2. **Then:** `fail_on: "deterministic"`. Lint/type/secret/audit/Supabase
+   findings that your change introduced block the merge.
+3. **Then:** `fail_on: "blocking"` with the AI rules your team trusts in
+   `ai_blocking_rules`. Start with rules the precision table marks
+   **eligible-to-block** (§20), e.g. `FLOW-03`, `SEC-01`, `ERR-02`.
+
+---
+
+## 11. The merge gate (`--fail-on`)
+
+| Level | Exit 1 when |
+|---|---|
+| `none` (default) | never |
+| `deterministic` | any deterministic check has **new** findings (status `FINDINGS`) |
+| `blocking` | `deterministic`, **or** a verified AI finding (at `min_severity`+) whose rule is in `gate.ai_blocking_rules` |
+| `any` | `deterministic`, **or** any verified AI finding at `min_severity`+ |
+
+Set it in `.quality-gate.json` (`gate.fail_on`), in the workflow (`fail-on:`),
+or on the CLI (`--fail-on`, or `--strict` for `deterministic`). Pre-existing
+issues (§13) never trip the gate. The report and console show the gate's
+result.
+
+---
+
+## 12. Reading the report (Markdown, JSON, SARIF)
+
+Every run writes to `quality-reports/` (or `--out`):
+
+| File | For |
+|---|---|
+| `latest.md` + `report-<timestamp>.md` | People. **Read this one** |
+| `latest.json` | Automation: `{ meta, checks, reviews }`. `meta.ai_review` holds the verified findings, rejected findings, questions and impacted files; `meta.ai_usage` holds tokens; `meta.gate` holds the gate result |
+| `latest.sarif` | GitHub code scanning / any SARIF viewer (also `--sarif FILE`) |
+
+**Check statuses**
+
+| Status | Meaning |
+|---|---|
+| **PASS** | Ran, nothing found |
+| **FINDINGS** | Ran, found issues **your change introduced** |
+| **INFO** | Only pre-existing issues, warnings, or an advisory check (e.g. an unenforced formatter) |
+| **SKIP** | Tool not installed or nothing in scope (folded into one line) |
+| **ERROR** | The *tool* failed (crash, OOM, timeout, missing config/lockfile), not your code |
+| **OFF** | Disabled in config |
+
+**AI review section**
+- **Header:** functions reviewed, verified findings, rejected count, rule-catalog
+  version, and **impacted files outside the diff**.
+- **Each finding:** severity, rule, `file:line`, scenario, the **verified
+  evidence** (quoted lines) and the fix.
+- **Collapsed sections:** minor findings, **Questions** (things the reviewer
+  couldn't decide from the code; not findings) and **Rejected by the evidence
+  check**, with the reason for each.
+- **AI usage:** a per-call token table (input, cache write, cache read, output,
+  time, ~USD at API list price). On a Claude Pro/Max/Team login, calls count
+  against plan limits instead.
+
+**SARIF details:** rule ids are `<check>/<rule>` for deterministic findings
+(e.g. `eslint/no-unused-vars`, `supabase/secret-key`) and `ai/<RULE>` for AI
+findings. Only **new** findings are included. Each result has a
+`partialFingerprints["qualityGate/v1"]` built from the rule, file and the
+line's text, so GitHub tracks it across runs even when lines move.
+
+---
+
+## 13. Big branches: scope, feature groups, batches
+
+### How scope is decided
+- **Default:** changed files vs the base branch's **fork point** (`git
+  merge-base`) up to your working tree. That covers every commit on the branch
+  plus uncommitted and untracked work, and ignores what landed on master after
+  you branched.
+- **`--all`:** everything git tracks. **`--staged`:** the index only.
+  **No git:** `--all`.
+
+### How "new" is decided
+- **Line-level tools** (ESLint, Ruff, Bandit, Supabase, Prettier): new when it's
+  on a line you changed. Moved-but-unchanged files are pre-existing.
+- **`tsc` / `mypy`:** new when it's in a file you changed. Errors in untouched
+  files are listed as "outside changed files". A changed signature *can* break
+  an untouched caller, so read that list. The AI review's NULL-02 /
+  CONTRACT-01 rules look at those callers directly.
+- **Dependency audit:** new only if the lockfile or a dependency field changed.
+- **Gitleaks:** only the change's commits are scanned, so everything it reports
+  is new.
+- **`--include-existing`** counts everything.
+
+### Feature groups (`Group-Id` trailers)
+
+Tag commits with the feature they belong to:
+```
+Inbox 5i: window escape hatch
+
+...body...
+
+Group-Id: conversations-inbox
+```
+```powershell
+qg --base origin/master --plan-groups                    # groups, files, ~tokens, warnings, commands (free)
+qg --base origin/master --no-ai --out quality-reports/branch
+qg --base origin/master --group conversations-inbox --ai-only --out quality-reports/group-conversations-inbox
+```
+- **What a group reviews:** only its files, at their final version. In function
+  mode, the group's commit subjects are sent as intent. In diff mode
+  (`--ai-mode diff`), its full messages are sent as claims to verify.
+- **Commits without a trailer** are grouped by shared files (`ungrouped-N`),
+  ignoring hub files (`package.json`, lockfiles, `group_hub_files`, files
+  touched by more than 30% of commits).
+- **Merge commits** are reviewed only for their conflict resolutions
+  (`git show --remerge-diff`).
+- **`Group-Id: a, b`** puts a commit in both groups.
+- **The plan warns about:** commits without a trailer, single-commit groups,
+  files changed by 3+ groups, and groups over `ai_max_chunks`.
+
+### Commit batches
+```powershell
+qg --base origin/master --plan-batches 10 --final-state      # plan + commands (free)
+qg --base origin/master --range <a>..<b> --final-state --ai-only --out quality-reports/batch-01
+```
+- **`--final-state`** reviews each file once, at its latest version.
+- **A literal `--range`** reviews exactly those commits' diffs, so code that
+  was rewritten later gets reviewed again.
+
+### Saving tokens
+- `review.skip_paths` / `ai_exclude`
+- `--only src/module`
+- A cheaper `review.model`
+- Fewer, larger calls (`ai_chunk_chars`)
+- In diff mode, also `ai_context_lines: 1` and `ai_ignore_whitespace: true`
+
+Deleted files send only their name; lockfiles, minified files, maps and
+binaries are never sent.
+
+---
+
+## 14. Supabase checks
+
+Supabase exposes every `public` table over a REST API, protected by Row Level
+Security, and the `service_role` key bypasses RLS. The built-in `supabase`
+check (no install needed; auto-detected) scans changed code and SQL migrations:
+
+| It flags | Severity |
+|---|---|
+| A `service_role`/secret key behind a browser-exposed env var (`NEXT_PUBLIC_`, `VITE_`, `REACT_APP_`, …) | HIGH |
+| A hardcoded `sb_secret_…` key, or a JWT whose payload says `"role": "service_role"` (decoded; project ref + expiry shown) | HIGH |
+| `service_role` referenced in a `'use client'` file | HIGH |
+| `alter table … disable row level security` | HIGH |
+| A public-schema `create table` that no migration ever enables RLS on | MEDIUM |
+| `grant <write> … to anon/public` | MEDIUM |
+| `grant <read>/execute … to anon/public` | LOW |
+| A policy targeting `service_role` (redundant) | LOW |
 
 **How it avoids false positives:**
-- **Comments are stripped** before the semantic rules run — `-- service_role
-  only`, `/* … disable row level security … */` or `// uses service_role` in a
-  comment never fire. (Secret rules still read raw text: a key pasted in a
-  comment is still a leaked key.)
-- **SQL is matched per statement**, not per line, so multi-line `create policy`
-  / `grant` statements are parsed whole. `GRANT EXECUTE … TO service_role` is not
-  a policy and is never flagged.
-- **RLS state is collected across every `.sql` file in the repo**, so a table
-  created in one migration and protected in a later one is fine.
-- Tables in non-public schemas (e.g. `private.audit`) aren't exposed by the REST
-  API and aren't flagged. `grant usage on schema … to anon` (a Supabase default)
-  is ignored.
-- Placeholders (`sb_secret_xxxx…`, `YOUR_…`, `<…>`, `${…}`, `...`) are ignored.
+- Comments are stripped before the semantic rules run.
+- SQL is matched per statement.
+- RLS state is collected across all migrations.
+- Non-public schemas are ignored.
+- Placeholders like `YOUR_…`, `xxxx` and `${…}` are ignored.
 
-> The anon key hardcoded in client code is **not** flagged — it's designed to be
-> public. RLS, not key secrecy, is what protects your data.
-
-**AI reviewer (`supabase`)** — runs under `qg --ai-full` and handles the judgment a
-regex can't: RLS *coverage & correctness* (`USING (true)`, missing `WITH CHECK`),
-ownership/IDOR (queries not scoped to `auth.uid()`), `security definer` RPC
-functions, public storage buckets, and sensitive columns exposed to clients. Add
-your Supabase rules to the project's `CLAUDE.md` to make it context-aware.
+The anon key in client code is **not** flagged; it's designed to be public.
 
 ---
 
-## 9. Onboarding a project & git automation
+## 15. Local git hooks
 
-Each project is onboarded **once**, then the gate runs automatically on `git commit`
-(fast, staged, deterministic) and `git push` (fuller review vs the base branch).
-You have three levels of automation — adopt them in order, as trust grows.
+CI is the enforcement layer. Hooks give fast local feedback before code leaves
+a laptop.
 
-### One-time onboarding (installs the hooks)
-
-Windows:
 ```powershell
-cd quality-gate
-.\hooks\install-hooks.ps1 -Repo C:\path\to\your-project
-```
-macOS/Linux:
-```bash
-cd quality-gate
-./hooks/install-hooks.sh /path/to/your-project
+.\hooks\install-hooks.ps1 -Repo C:\path\to\project      # Windows
+./hooks/install-hooks.sh /path/to/project               # macOS/Linux
 ```
 
-The installer, entirely inside the target repo:
-1. Vendors the scanner into `<repo>/.quality-gate/` (so it travels with the repo).
-2. Installs `pre-commit` + `pre-push` into `<repo>/.githooks/`.
-3. Runs `git config core.hooksPath .githooks`.
-4. Adds `quality-reports/` to `.gitignore`.
+The installer works entirely inside the target repo:
+1. It vendors `scan.js`, `lib/`, `rules/`, `baselines/` and the prompts into
+   `.quality-gate/`. The gate never scans this folder.
+2. It creates `.quality-gate.json` from the example, if the project has none.
+3. It installs `pre-commit` (staged, no AI) and `pre-push` (vs base, no AI unless
+   `QG_AI=1`) into `.githooks/`.
+4. It sets `git config core.hooksPath .githooks` and ignores `quality-reports/`.
 
-Then commit the setup so it ships with the repo:
-```bash
-git add .githooks .quality-gate .gitignore
-git commit -m "Add MarketInk Quality Gate hooks"
-```
+Commit `.githooks .quality-gate .quality-gate.json .gitignore`. Each teammate
+runs `git config core.hooksPath .githooks` once per clone, because git never
+auto-enables hooks.
 
-**Files added by this setup:**
-
-| File | Purpose |
-|---|---|
-| `<repo>/.quality-gate/` | vendored scanner (committed with the repo) |
-| `<repo>/.githooks/pre-commit` | fast staged scan on commit |
-| `<repo>/.githooks/pre-push` | fuller scan on push |
-
-### Level 1 & 2 — Local hooks (behaviour & toggles)
-
-| Hook | Default | Scope |
-|---|---|---|
-| `pre-commit` | notify only, never blocks | staged changes, no AI (fast) |
-| `pre-push` | notify only, never blocks | changed vs base, no AI |
-
-Set as env vars:
-- `QG_BLOCK=1` → **abort** the commit/push if there are findings.
-- `QG_AI=1` → include the Claude AI review on push (slower).
-- `git commit/push --no-verify` → bypass the hook (git's built-in escape hatch).
-
-> **The honest catch about "everyone gets it on pull":** git **deliberately** does
-> not run hooks that arrive via `clone`/`pull` (auto-running fetched code would be a
-> security hole). So there is always **one** action per developer per clone:
-> `git config core.hooksPath .githooks`. That's unavoidable for *local* hooks — which
-> is why CI (below) is the real enforcement layer.
-
-### Level 3 — CI on every Pull Request (the team standard, unskippable)
-
-A ready-made GitHub Actions workflow ships at `.github/workflows/quality-scan.yml`.
-It runs on every PR (and manual dispatch), scans the **PR diff**
-(`--base origin/<base_branch>`), is **`continue-on-error: true`** (never fails the
-build yet), uploads the report as a downloadable artifact, **and posts the report
-straight onto the PR as a comment** (updating the same comment on re-runs).
-
-**Set it up in a project:**
-
-1. Copy the workflow in:
-   ```powershell
-   Copy-Item E:\MarketInk\Quality_Gate\quality-gate\.github\workflows\quality-scan.yml `
-             E:\path\to\my-project\.github\workflows\
-   ```
-2. Add to the project's `.gitignore`:
-   ```
-   quality-reports/
-   .quality-gate-tool/
-   ```
-3. Commit and open a PR. The workflow clones the scanner from
-   `https://github.com/sarthakkk1212/quality-gate.git` at run time, scans the PR
-   diff, and posts results as a PR comment. For the comment to post, enable repo
-   **Settings → Actions → General → Workflow permissions → "Read and write
-   permissions"** (the workflow already declares `pull-requests: write`). PRs from
-   *forks* get a read-only token, so the comment step is skipped there (the artifact
-   still uploads).
-4. **To run deterministic tools in CI too**, uncomment the install step and list
-   what the repo uses (e.g. `pip install ruff mypy bandit pip-audit`; for JS/TS add
-   an `npm ci` step so `node_modules` exists).
-5. **Make it blocking later** — once the false-positive rate is low and the team
-   trusts the signal, flip `continue-on-error: true` → `false` (and add `--strict`)
-   so a PR with findings fails the check.
-
-> **AI review in CI** uses `--no-ai` by default because the `claude` CLI needs
-> credentials. To enable it: install Claude Code in the workflow, provide API
-> credentials via GitHub **Secrets**, and drop `--no-ai`.
-
-### The end-to-end flow (the whole point)
-
-```
-Developer writes code
-        │  (local)  qg  ──► fix issues in your own diff, privately. Fast loop.
-        ▼
-  git commit ──► pre-commit hook (advisory)            [Level 1]
-        ▼
-  git push   ──► pre-push hook (QG_BLOCK=1 blocks)      [Level 2]
-        ▼
-  Open PR ──► quality-scan.yml runs on the PR diff      [Level 3]
-        │       → report as artifact + PR comment
-        ▼
-  Reviewer reads findings + AI review, requests changes if needed
-        ▼
-  All clear → merge.  The defect never reaches main.
-```
-
-**Best practice: use both layers** — local hooks for instant feedback, CI as the
-enforcement that can't be skipped.
+- `QG_BLOCK=1` blocks on findings.
+- `QG_AI=1` adds the AI review on push.
+- `--no-verify` bypasses a hook.
 
 ---
 
-## 10. Troubleshooting
+## 16. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **Everything Python shows `SKIP`** | Those tools aren't installed / not on PATH | `pip install ruff mypy bandit pip-audit` |
-| **A JS tool shows `SKIP`** even though installed globally | JS tools must be **local** to the project | `npm install -D eslint prettier typescript` inside the project |
-| **Dependency audit → SKIP "no lockfile found"** | The repo has `package.json` but no `pnpm-lock.yaml` / `yarn.lock` / `bun.lock` / `package-lock.json` | Commit the lockfile your package manager makes |
-| **Dependency audit → SKIP "pnpm not found on PATH"** | The lockfile is pnpm's but `pnpm` isn't installed globally | `npm i -g pnpm` (or `corepack enable`) |
-| **Dependency audit → ERROR "audit could not run"** | Registry unreachable, or the package manager refused the lockfile | Check network/registry; the message shows the package manager's error |
-| **Dependency audit → INFO "dependencies unchanged"** | Advisories exist but your change didn't touch deps — they're on base too | Fix them separately (or `--include-existing` to count them) |
-| **`tsc` → ERROR "Node ran out of memory"** | Project too big for the heap | Raise `node_max_old_space_mb` in the config (default 8192) |
-| **ESLint/Prettier → ERROR "command line too long"** | Shouldn't happen any more (lists are batched) | Report it; meanwhile narrow with `--only` |
-| **ESLint → SKIP "no ESLint config"** | The project has ESLint installed but no config file | Add an `eslint.config.*`, or ignore |
-| **Prettier shows INFO "advisory: not enforced"** | Nothing in the project runs Prettier (no hook/CI/lint-staged) | Team decision: enforce it (then it becomes a finding) or drop it; `format_checks` in config overrides |
-| **AI review "coverage – PARTIAL"** | The branch was bigger than `ai_max_chunks` parts | `--ai-max-chunks 30`, or review module by module with `--only` |
-| **`error: base ref not found`** | The `--base` ref doesn't exist locally | `git fetch origin`, then retry |
-| **`tsc` says "Could not find a declaration file for 'pg'"** | Real project gap, not a scanner bug | `npm i -D @types/pg` (the gate faithfully reports your `tsc` output) |
-| **AI review says "skipped"** | `claude` not on PATH, **or** you used `--all`, **or** the diff is empty | Install Claude Code; drop `--all` (AI is diff-based) |
-| **"not a git repository — scanning the whole project"** | You're outside a git repo | Expected; it falls back to `--all` automatically |
-| **A tool timed out (`ERROR`)** | Very large repo | Raise it: `qg --timeout 1200` |
-| **First run floods me with issues** | You used `--all` (or `--include-existing`) on a legacy repo | Drop it — the default reports only what *your* change introduced |
-| **Report didn't appear** | You used `--no-report`, or the out dir wasn't writable | Remove `--no-report`, or set `--out` to a writable folder |
+| `note: typescript is not installed … using the diff review instead` | The project has no `typescript` in `node_modules` (or deps weren't installed in CI) | `npm i -D typescript`; in CI check the "Install project dependencies" step |
+| AI review: `no changed TS/JS source files` | Only tests, docs or skipped paths changed | Expected; adjust `review.skip_paths` to review tests |
+| Many findings **rejected by the evidence check** | The model quoted code that isn't there, or pointed outside the reviewed code | Working as intended. If a rejected finding was correct, check that the code was in the packet (e.g. raise `max_callers`, `max_body_lines`) |
+| Impact analysis `failed: Node ran out of memory` | Very large program | Raise `node_max_old_space_mb` |
+| AI review skipped in CI | No `ANTHROPIC_API_KEY` secret, a `push` event (AI runs on PRs), or `ai: never` | Add the org secret; use `ai: always` to review pushes too |
+| `ai backend 'sdk' requested but @anthropic-ai/sdk is not installed` | Local run with `--ai-backend sdk` | `npm install` in the quality-gate folder (optional dependency), or use `--ai-backend cli` |
+| `ai backend 'sdk' requested but ANTHROPIC_API_KEY is not set` | SDK backend needs an API key | Set the key, or `--ai-backend cli` to use your Claude login |
+| `request declined by safety classifiers` | A rare refusal on code that resembles exploits | Fallbacks are on by default; the call shows as ERROR and other calls continue |
+| `batch … still processing after Ns` | The Batches API hasn't finished | Raise `review.batch_wait_sec`, or drop `--ai-batch` for PR runs |
+| Cached reviews look stale | Rules, prompt, context files, model or effort changed | They're part of the cache key, so a change invalidates automatically; `--no-cache` forces a fresh review |
+| Inline AI comments missing | The finding is in a file/line outside the PR diff (e.g. an impacted caller), or the token can't write | It's still in the summary comment and SARIF; check workflow permissions |
+| Precision table empty | The feedback workflow hasn't run yet, or there are no reactions | Run "Quality Gate feedback" manually (`workflow_dispatch`) |
+| Type errors suddenly count as new | They're in callers of a function you changed (§7) | Fix the callers, or set `review.impact_for_types: false` |
+| SARIF upload step warns | Private repo without GitHub Advanced Security | Expected; set `upload-sarif: false` to hide it |
+| No PR comment | Workflow permissions are read-only, or the PR comes from a fork | Settings → Actions → Workflow permissions → Read and write |
+| `config: unknown config key` | Typo in `.quality-gate.json` | Fix the key (see §9) |
+| `error: config not found` / `extends … not found` | Wrong `--config` path or baseline name | Check the path; baselines live in `baselines/` |
+| `error: base ref not found` | Ref not fetched | `git fetch origin` (CI uses `fetch-depth: 0`) |
+| Dependency audit SKIP "no lockfile" / "pnpm not found" | Missing lockfile / package manager | Commit the lockfile; `corepack enable` |
+| Dependency audit ERROR "audit could not run" | Registry unreachable or lockfile refused | See the message in the report |
+| `tsc` ERROR "Node ran out of memory" | Big project | Raise `node_max_old_space_mb` |
+| Prettier INFO "advisory: not enforced" | Nothing enforces Prettier | Enforce it (then it's a finding) or set `format_checks` |
+| A tool timed out | Very large repo | `--timeout 1200` |
+| First run floods with issues | `--all` or `--include-existing` on legacy code | Drop them; the default reports only new issues |
 
 ---
 
-## 11. Cheat sheet
+## 17. Cheat sheet
 
 ```
-# --- daily (local) ---
-qg                          # scan my changes + AI review  ← use this most
-qg --no-ai                  # faster, offline, just linters/types/security
-qg --ai-full                # deep 6-reviewer AI pass before an important PR
-qg --staged                 # only staged changes (pre-commit)
-qg --base origin/master     # a whole feature branch (all commits) vs master
-qg --base origin/master --only src/billing   # ...one module at a time
-qg --base origin/master --plan-groups        # plan a per-feature AI review (Group-Id)
-qg --base origin/master --group <id> --ai-only   # review one feature
-qg --base origin/master --plan-batches 10 --final-state   # plan a batched AI review
-qg --base origin/master --range A..B --final-state --ai-only   # one batch
-qg --include-existing       # also count issues already on the base branch
-qg --base v1.4.0            # everything since a release
-qg --path ..\repo --all --no-ai   # one-time full audit of another repo
-qg --strict                 # exit 1 on findings (hooks / CI gating)
-qg --no-report              # console only, write nothing
+# daily
+qg                                   # my changes + function-level AI review
+qg --no-ai                           # free checks only
+qg --staged                          # staged only
+qg --fail-on deterministic           # behave like CI's gate
+qg --ai-full                         # every rule, incl. off-by-default
+qg --ai-mode diff                    # previous diff-based AI review
+qg --sarif out/gate.sarif            # also write SARIF
+qg --ai-backend sdk --ai-batch       # API key + SDK, half-price batch
+qg --no-cache                        # ignore cached per-function reviews
+qg --rule-stats rule-stats.json      # demote low-precision rules
 
-# --- what it is ---
-# qg = node E:\MarketInk\Quality_Gate\quality-gate\scan.js
-# Report → ./quality-reports/latest.md (in the folder you ran it from)
-# READ-ONLY: never edits code, never touches git, never installs anything.
+# big branches
+qg --base origin/master --plan-groups            # per-feature plan (Group-Id)
+qg --base origin/master --group <id> --ai-only   # one feature
+qg --base origin/master --plan-batches 10 --final-state
+qg --base origin/master --only src/billing
 
-# --- install tools (only what a project uses) ---
-pip install ruff mypy bandit pip-audit          # Python (on PATH)
-npm install -D eslint prettier typescript       # JS/TS/React/Next (in project)
-winget install gitleaks.gitleaks                # secrets (on PATH)
-# + Claude Code on PATH for AI review
+# CI (per project)
+.github/workflows/quality-gate.yml   -> uses: sarthakkk1212/quality-gate/.github/workflows/quality-gate.yml@v2
+.quality-gate.json                   -> { "extends": "marketink", ... }
+secrets: ANTHROPIC_API_KEY (org)     [+ QUALITY_GATE_TOKEN if the tool repo is private]
 
-# --- statuses ---
-PASS = clean   FINDINGS = new issues, fix these   INFO = pre-existing/advisory
-SKIP = tool missing / nothing in scope   ERROR = the tool failed   OFF = disabled
-
-# --- automate ---
-# Level 1: pre-commit  → advisory (QG_BLOCK=1 to block)
-# Level 2: pre-push    → fuller scan (QG_BLOCK=1 to block push on findings)
-# Level 3: .github/workflows/quality-scan.yml → runs on every PR + PR comment
+# statuses
+PASS clean · FINDINGS new issues · INFO pre-existing/advisory · SKIP n/a · ERROR tool failed · OFF disabled
+# exit codes
+0 ok / gate passed · 1 gate failed · 2 bad input
 ```
 
 ---
 
-## 12. Notes: migration & roadmap
+## 18. Versioning, migration & roadmap
 
-### Migration `scan.py` → `scan.js` (done)
+### Versions
+- **Tag releases.** Projects pin a **major** tag (`@v2`) in their workflow and
+  `tool-ref`. Rule-catalog or baseline changes inside a major version are
+  backwards-compatible; breaking changes get a new major tag.
+- **`scan.js --help`** shows the flags. Every report records the tool version
+  (`meta.version`) and the config files used.
 
-The scanner was migrated from a Python file (`scan.py`) to a single Node file
-(`scan.js`) with **zero npm dependencies** — because Node is already on every
-machine and CI runner in an all-JS/TS org, while Python was the odd one out. It's a
-**wrapper-language swap, not a redesign**: same two layers, same read-only
-guarantee, same report format, and **all check specs kept** (including the Python
-ones — the tool still scans Python projects by shelling out to `ruff`/`mypy`/
-`bandit`/`pip-audit`). `scan.py` is kept one release as a fallback, then removed.
+### What changed in 2.0
+- **Function-level AI review is the default:** impact analysis with the
+  project's TypeScript, a fixed rule catalog, JSON output and evidence
+  verification. The previous diff review is `--ai-mode diff`.
+- **Org baseline + per-project `.quality-gate.json` with `extends`.** The old
+  `quality-gate.config.json` next to `scan.js` was removed; it is still read
+  (with a warning) if present.
+- **Reusable GitHub workflow** (`.github/workflows/quality-gate.yml`) +
+  examples. The old copy-in `quality-scan.yml` was removed.
+- **SARIF output** and **`--fail-on`** gates (`--strict` still works).
+- **The gate no longer scans its own vendored copy.**
+- `scan.py` (the pre-Node fallback) has none of the 1.x/2.0 features; use
+  `scan.js`.
 
-> Windows note: npm-installed bins are `.cmd` shims (`eslint.cmd`, `tsc.cmd`,
-> `npm.cmd`); the scanner resolves the absolute path via its `which`/`localBin`
-> helpers and runs it without a shell. Node's `spawnSync` timeout is in **ms** (the
-> `--timeout` seconds are converted).
-
-### Built today
-
-- ✅ `scan.js` — read-only scanner (Node, zero deps): 11 deterministic checks +
-  Claude AI review, with 6 specialized AI reviewers under `--ai-full`.
-- ✅ Built-in Supabase check + dedicated Supabase AI reviewer (§8).
-- ✅ Wrappers (`quality.ps1`, `quality`), optional config, `CLAUDE.template.md`.
-- ✅ One-time hook installer (`hooks/install-hooks.*`) + `pre-commit`/`pre-push`.
-- ✅ GitHub Actions CI workflow — non-blocking, uploads artifact, **posts the report
-  as a PR comment** and updates it on re-runs.
-- ✅ Markdown + JSON + timestamped reports.
-- ✅ Accuracy pass (validated against a 600-file CRM branch): new-vs-pre-existing
-  baseline, tool-crash detection, Windows command-line batching, lockfile-aware
-  dependency audit, branch-scoped gitleaks, statement-level Supabase rules,
-  enforcement-aware format checks, chunked AI review, `--only`.
-  *`scan.py` (the fallback) does not have these — use `scan.js`.*
+### Also in 2.0 (cost & trust)
+- **Cost:**
+  - SDK backend (prompt caching, structured output, effort, refusal fallbacks);
+  - Batches API option;
+  - per-function review cache;
+  - risk-ordered budgets.
+- **Trust:**
+  - inline 👍/👎 comments;
+  - weekly precision workflow (`quality-gate-feedback.yml`, `lib/feedback.js`);
+  - automatic demotion of low-precision rules;
+  - "eligible to block" hints;
+  - `tsc`/`mypy` errors in impacted callers counted as new.
 
 ### Roadmap
-
-- ⏳ A `quality init` command that bootstraps a project automatically.
-- ⏳ A three-level `quality quick / review / release` CLI wrapper.
-- ⏳ `.claude/commands/` slash-command reviewers and a pre-commit-framework config.
-- ⏳ AI-in-CI (Claude review on every PR) and a team metrics dashboard.
+- **More languages for the function review** (Python next).
+- **Org-wide precision:** aggregate rule stats across all projects, not just
+  per repo.
+- **Auto-promotion:** let rules that stay "eligible-to-block" join
+  `ai_blocking_rules` automatically (opt-in).
 
 ---
 
-*Read-only by design. It tells you what's wrong; it never touches your code, your
-git history, or your dependencies. The worst it can do is write a report.*
+## 19. Cost controls: backends, cache, budgets, batches
+
+### Backends (`review.backend`, `--ai-backend`)
+
+| Backend | When it's used | How it calls Claude | Billing |
+|---|---|---|---|
+| **`sdk`** | `ANTHROPIC_API_KEY` set **and** `@anthropic-ai/sdk` installed (CI installs it into the tool folder; locally run `npm install` in the quality-gate folder) | Official Anthropic SDK: `messages.create`; the fixed prefix (instructions, rules, project context) is a **cached system prompt** (`cache_control`); **structured JSON output** (`output_config.format`); explicit `effort` (default `high`); **server-side refusal fallbacks** (`fallbacks: "default"`); 4 calls in parallel | Org API account, per token |
+| **`cli`** | No API key or no SDK (typical on a laptop) | `claude -p` with no tools, `--restricted`, `--json-schema` | Your Claude login (Pro/Max/Team limits) |
+| `auto` (default) | — | `sdk` if possible, else `cli` | — |
+
+The default model is `claude-opus-5-5` on the SDK backend. Set `review.model`
+(e.g. `claude-sonnet-5-5`) and/or `review.effort` (`medium`) per project for a
+cheaper review, and compare quality on a few PRs before standardising.
+
+### Per-function review cache (`review.cache`)
+- **The key covers everything that can change a result:** each function's
+  packet (new + old body, caller snippets, callee signatures), the prefix
+  (instructions, **rule catalog**, **context files**, compiler facts), the
+  model, the effort and the output schema.
+- **A cache hit skips the call.** The cached findings are **re-verified against
+  the current files** like fresh ones, so a cache hit can't bypass the
+  evidence check.
+- **Edits elsewhere can still invalidate a function.** Editing a caller changes
+  that function's caller snippet, so it is reviewed again. That's intended: the
+  review depends on its callers.
+- **Location:** `~/.cache/marketink-quality-gate/reviews` by default (outside
+  the repo); `--cache-dir`, `review.cache_dir` or `QG_CACHE_DIR` change it.
+  Entries older than `cache_days` are pruned. `--no-cache` forces a fresh
+  review.
+- **In CI** it's restored/saved with `actions/cache` per branch, falling back
+  to the repo's latest cache.
+
+Measured: reviewing the same 2 functions again cost **0 calls / 0 tokens**.
+
+### Budgets & risk ordering
+- `review.max_input_tokens` (default 400k) is the per-run input budget, and
+  `ai_max_chunks` caps the number of calls.
+- Functions are packed **riskiest first** (§7), so a budget cut always drops
+  the lowest-risk functions. The report lists them.
+- `review.max_functions` caps the impact analysis itself.
+
+### Batches API (`--ai-batch`, `review.batch`)
+- **Half price, asynchronous** (usually minutes).
+- `always` uses it every time; `auto` uses it when a run needs ≥
+  `batch_min_calls` calls.
+- The scan waits up to `batch_wait_sec`, then reports the batch id. Good for
+  nightly, deep or big-branch reviews; keep it off for fast PR feedback.
+- Server-side fallbacks aren't available on batches, so they're off there.
+
+### Seeing the cost
+Every call records input, cache write, cache read, output and time:
+- the console shows it live;
+- the report has a per-call table;
+- `meta.ai_usage` and the PR comment show the run's total.
+
+The `~USD` figure uses the published per-model API prices (halved for
+batches). On a subscription login, calls count against plan limits instead.
+
+---
+
+## 20. Trust: inline feedback, rule precision, auto-demotion
+
+### The loop
+
+```
+PR run ──► verified AI finding ──► inline PR comment "👍 real / 👎 wrong"   (+ SARIF alert)
+                                                │
+weekly ──► quality-gate-feedback.yml ──► lib/feedback.js reads reactions + alert fixes/dismissals
+                                                │
+                                                ▼
+                         per-rule precision → Actions cache (default branch)
+                                                │
+next PR run ──► --rule-stats ──► rules often wrong → ADVISORY (not posted, not gating)
+                                 rules usually right → "eligible-to-block" hint
+```
+
+### Signals counted per finding (one verdict each)
+
+| Signal | Counts as |
+|---|---|
+| 👍 on the inline comment | real |
+| 👎 on the inline comment (wins over 👍) | wrong |
+| Code-scanning alert for `ai/<RULE>` **fixed** | real |
+| Alert **dismissed as "false positive"** | wrong |
+| "won't fix" / "used in tests" dismissals | ignored (they say nothing about correctness) |
+
+### What the gate does with it (`review.precision`)
+
+| Status | Condition (defaults) | Effect |
+|---|---|---|
+| `collecting` | fewer than 10 rated findings | Normal |
+| `ok` | 50–85% precision | Normal |
+| `demoted` | **< 50%** with ≥ 10 samples | Findings move to the report's **Advisory** section; not posted, not in SARIF, never trip the gate |
+| `eligible-to-block` | **≥ 85%** with ≥ 10 samples | A hint: safe to add to `gate.ai_blocking_rules` |
+
+The report shows the precision table (rule, 👍, 👎, precision, status). A rule
+recovers on its own if later feedback improves.
+
+### Setup
+1. Keep `inline-comments: true` (the default) in the PR workflow.
+2. Add `examples/github/quality-gate-feedback.yml` (weekly + manual run). It
+   needs `pull-requests: read`, `security-events: read` and `actions: write`
+   (to save the cache).
+3. Ask reviewers to react 👍/👎 on the gate's inline comments. That's the
+   whole cost of the loop.
+
+**Run it locally:**
+```bash
+GITHUB_TOKEN=... GITHUB_REPOSITORY=org/repo node lib/feedback.js --days 90 --out rule-stats.json
+qg --rule-stats rule-stats.json
+```
+
+---
+
+*Read-only by design. It tells you what's wrong, with proof; it never touches
+your code, your git history or your dependencies.*

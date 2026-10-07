@@ -1,0 +1,23 @@
+# Copy into a project as .github/workflows/quality-gate-feedback.yml
+# Weekly: turns reviewers' 👍/👎 on AI findings (and code-scanning dismissals)
+# into per-rule precision. PR runs then demote rules that are often wrong.
+name: Quality Gate feedback
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"   # Mondays 03:17 UTC
+  workflow_dispatch:
+
+jobs:
+  rule-precision:
+    uses: sarthakkk1212/quality-gate/.github/workflows/quality-gate-feedback.yml@v2
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: read
+      actions: write
+    with:
+      tool-ref: v2
+      days: "90"
+    secrets:
+      QUALITY_GATE_TOKEN: ${{ secrets.QUALITY_GATE_TOKEN }}   # only if the tool repo is private

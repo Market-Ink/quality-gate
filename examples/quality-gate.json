@@ -1,0 +1,29 @@
+{
+  "_comment": "Copy to the project root as .quality-gate.json. Everything not set here comes from the org baseline (baselines/marketink.json). Keys starting with _ are comments.",
+  "extends": "marketink",
+
+  "disabled_checks": [],
+
+  "gate": {
+    "fail_on": "deterministic",
+    "ai_blocking_rules": []
+  },
+
+  "review": {
+    "rules": {
+      "disable": [],
+      "enable": [],
+      "custom": [
+        {
+          "id": "PRJ-01",
+          "title": "Supabase query result not checked",
+          "check": "A supabase-js call's { error } is ignored and its data is used.",
+          "severity": "high"
+        }
+      ]
+    },
+    "context_files": ["CLAUDE.md", "docs/decisions.md"],
+    "skip_paths": ["**/*.test.*", "**/*.spec.*", "**/__tests__/**", "e2e/**", "**/*.d.ts"],
+    "min_severity": "medium"
+  }
+}
