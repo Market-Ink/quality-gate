@@ -243,6 +243,7 @@ the scanned project, unless you pass `--out`.
 --no-cache           don't reuse cached per-function reviews
 --cache-dir DIR      review cache folder (default ~/.cache/marketink-quality-gate)
 --rule-stats FILE    per-rule precision (from lib/feedback.js); demotes weak rules
+--no-move-detection  treat code moved unchanged from the base as new (skip git blame -C)
 --sarif FILE         also write SARIF 2.1.0 to FILE
 --no-report          print only; write no files
 --out DIR            report directory (default: ./quality-reports)
@@ -333,6 +334,46 @@ Evidence (verified against the file):
   `jsconfig.json`.
 - **Not yet:** the AI review only runs on scoped scans (not `--all`), and
   Python files only get the diff-based review.
+
+### Moved code is pre-existing, not new
+
+Refactors move code: a page's logic extracted into `lib/data/*`, a function
+moved to another module. Git shows every moved line as *added*, which would
+make old issues look like the refactor's fault. The gate runs **move
+detection** (`git blame -w -C -M` from the fork point on files with ≥ 20
+changed lines) and marks lines **copied unchanged from code that existed at
+the base**:
+- Each packet tells the reviewer which ranges are **new or edited** and which
+  are **moved unchanged** (pre-existing). The prompt forbids blaming moved
+  code on the change.
+- A finding counts as **new** only if its location or one of its quoted lines
+  is a new or edited line. Findings that rest entirely on moved (or untouched)
+  code go to a separate **Pre-existing** section: still reported, never
+  posted inline, never in SARIF, never gating.
+- Deterministic checks use the same rule: a lint or type error on a moved line
+  is pre-existing.
+- `review.moved_code: "skip"` doesn't review functions that are 100% moved
+  code at all (cheapest for big refactors). `--no-move-detection` turns the
+  whole thing off.
+- Measured on a real 6-commit extraction: 4,921 changed lines in 15 files
+  recognised as moved, in about a minute.
+
+### Grounding: schema facts, decisions, unverified fixes
+- **Schema facts.** The gate parses the SQL migrations (`create type … as
+  enum`, `alter type … add value`, `CHECK (col IN (…))`, `= ANY (ARRAY[…])`)
+  into the allowed values of each column. Packets that use a column get its
+  values as **SCHEMA FACTS**, so a literal like `'contacted'` that isn't in
+  `leads.status` is caught, and suggested fixes use real values. Schema facts
+  are accepted as evidence. Archived/backup migration folders are ignored
+  (`review.schema_exclude` adds more).
+- **Project decisions** (§9) are sent as authoritative context, and the prompt
+  rates severity against them. For example, if an ADR says every user may see
+  every location, a missing location filter is a display bug, not an
+  authorization bypass.
+- **Runtime behaviour that isn't shown** (how PostgREST, the database or a
+  library reacts to some input) must go to *Questions*, not findings.
+- **Suggested fixes are labelled "not verified by the tool".** The evidence
+  check proves the problem's quotes exist. It can't prove a fix is right.
 
 **Risk ordering.** Functions are reviewed riskiest first. Risk goes up with:
 - callers outside the diff;
@@ -469,8 +510,12 @@ built-in defaults
 | `review.rules.enable` | `[]` | Extra rule ids **or groups** to turn on (e.g. `"QUALITY-02"`) |
 | `review.rules.disable` | `[]` | Rule ids or groups to turn off (e.g. `"performance"`) |
 | `review.rules.custom` | `[]` | Project rules: `{ "id", "title", "check", "severity" }` |
-| `review.context_files` | `["CLAUDE.md","AGENTS.md"]` | Project files sent as authoritative context (decisions aren't bugs) |
-| `review.context_chars` | `12000` | Max characters of context files per call |
+| `review.context_files` | `["CLAUDE.md","AGENTS.md","docs/adr/*.md","docs/decisions/*.md"]` | Authoritative project context. **Plain paths** are always sent (up to `context_file_chars` each). **Globs** form a decision library: every doc's **Decision section** is sent in brief (`context_doc_summary_chars` each); leftover budget goes to the full text of the docs most related to the code |
+| `review.context_chars` | `60000` | Total context budget per call (prompt-cached on the SDK backend) |
+| `review.context_file_chars` / `context_doc_chars` / `context_doc_summary_chars` | `24000` / `6000` / `700` | Caps per pinned file / per full library doc / per decision brief |
+| `review.move_detection` / `move_detection_min_lines` | `true` / `20` | Treat code moved unchanged from the base as pre-existing (§7) |
+| `review.moved_code` | `"classify"` | `classify`: review moved code, report its findings as pre-existing · `skip`: don't review 100%-moved functions |
+| `review.schema_facts` / `schema_exclude` | `true` / `[]` | Allowed column values from SQL migrations; extra globs of SQL to ignore |
 | `review.skip_paths` | tests, mocks, stories, e2e, `.d.ts` | Globs never sent to the AI review |
 | `review.max_functions` | `80` | Max functions reviewed per run |
 | `review.max_callers` | `8` | Caller snippets shown per function |
@@ -682,7 +727,11 @@ line's text, so GitHub tracks it across runs even when lines move.
 
 ### How "new" is decided
 - **Line-level tools** (ESLint, Ruff, Bandit, Supabase, Prettier): new when it's
-  on a line you changed. Moved-but-unchanged files are pre-existing.
+  on a line you changed. Moved-but-unchanged files are pre-existing, and so are
+  lines moved unchanged into other files (move detection, §7).
+- **AI review:** new when the finding's location or a quoted line is new or
+  edited; findings resting only on moved/untouched code are listed as
+  pre-existing.
 - **`tsc` / `mypy`:** new when it's in a file you changed. Errors in untouched
   files are listed as "outside changed files". A changed signature *can* break
   an untouched caller, so read that list. The AI review's NULL-02 /
@@ -813,6 +862,10 @@ auto-enables hooks.
 | Inline AI comments missing | The finding is in a file/line outside the PR diff (e.g. an impacted caller), or the token can't write | It's still in the summary comment and SARIF; check workflow permissions |
 | Precision table empty | The feedback workflow hasn't run yet, or there are no reactions | Run "Quality Gate feedback" manually (`workflow_dispatch`) |
 | Type errors suddenly count as new | They're in callers of a function you changed (§7) | Fix the callers, or set `review.impact_for_types: false` |
+| A refactor PR shows many findings in code it only moved | Move detection didn't run (fewer than 20 changed lines, `--staged`, no base) or the code was edited while moving | They're listed under **Pre-existing** when detection applies; edited lines count as new by design |
+| Move detection is slow | `git blame` on many large new files | It runs 4 at a time on files with ≥ 20 changed lines; raise `move_detection_min_lines` or use `--no-move-detection` |
+| The reviewer ignored a project decision | The doc isn't matched by `review.context_files`, or has no "Decision" heading | Add its path/glob; give ADRs a `## Decision` section (the brief is taken from it) |
+| Schema facts missing for a column | Its values are defined outside SQL migrations (app constants, generated types) | Only SQL `enum`/`CHECK` definitions are parsed; archive/backup folders are skipped on purpose |
 | SARIF upload step warns | Private repo without GitHub Advanced Security | Expected; set `upload-sarif: false` to hide it |
 | No PR comment | Workflow permissions are read-only, or the PR comes from a fork | Settings → Actions → Workflow permissions → Read and write |
 | `config: unknown config key` | Typo in `.quality-gate.json` | Fix the key (see §9) |

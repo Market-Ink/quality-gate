@@ -249,6 +249,7 @@ jobs:
                 lines.push(`**AI review (changed functions):** ${ai.functions} function(s), ${aiCount} verified finding(s)` +
                   ` at ${ai.min_severity}+, ${ai.rejected.length} rejected by the evidence check, ` +
                   `${ai.impacted_files.length} impacted file(s) outside the diff` +
+                  (ai.preexisting && ai.preexisting.length ? `, ${ai.preexisting.length} pre-existing (moved/untouched code)` : '') +
                   (ai.advisory && ai.advisory.length ? `, ${ai.advisory.length} advisory (low-precision rules)` : '') +
                   (ai.cache && ai.cache.enabled ? `, ${ai.cache.hits} function(s) from cache` : '') + '.', '');
                 for (const f of ai.posted.slice(0, 10)) {

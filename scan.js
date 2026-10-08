@@ -397,10 +397,98 @@ function isNew(scope, f, mode) {
   const entry = scope.lines.get(k);
   if (!entry) return false;
   if (entry === ALL_LINES) return true;
-  if (f.line == null) return entry.size > 0;
+  // Lines copied unchanged from code that already existed at the base (moves,
+  // extractions) are not new, even though git shows them as added.
+  const moved = (scope.moved && scope.moved.get(k)) || null;
+  const fresh = (n) => entry.has(n) && !(moved && moved.has(n));
+  if (f.line == null) return [...entry].some(fresh);
   const end = f.endLine || f.line;
-  for (let n = f.line; n <= end; n++) if (entry.has(n)) return true;
+  for (let n = f.line; n <= end; n++) if (fresh(n)) return true;
   return false;
+}
+
+// Is file:line added or edited by this change (not merely moved)?
+function isFreshLine(scope, file, line) {
+  const k = keyOf(file);
+  const entry = scope.lines.get(k);
+  if (!entry) return false;
+  if (entry === ALL_LINES) return true;
+  const moved = scope.moved && scope.moved.get(k);
+  return entry.has(line) && !(moved && moved.has(line));
+}
+
+/**
+ * Lines of changed files that were COPIED UNCHANGED from code that already
+ * existed at the fork point (a function moved to another file, a page split
+ * into loaders, ...). Uses `git blame -C -C -w` over fork..HEAD on the
+ * working-tree contents: a line whose origin is at or before the fork is
+ * reported as a "boundary" line. Read-only; runs only on files with enough
+ * changed lines to plausibly contain a move.
+ */
+function blameMoved(target, rel, fromRef, timeoutMs) {
+  const { spawn } = require("child_process");
+  return new Promise((resolve) => {
+    const out = [];
+    // One -C: code moved/copied from files changed in the same commit (an
+    // extraction deletes it from the old file in that commit). Measured on a
+    // real extraction: same lines found as -C -C, ~30% faster.
+    const p = spawn("git", ["-c", "core.quotepath=false", "blame", "-w", "-C", "-M", "--line-porcelain",
+      "--contents", path.join(target, rel), `${fromRef}..HEAD`, "--", rel], { cwd: target, windowsHide: true });
+    const timer = setTimeout(() => p.kill(), timeoutMs);
+    p.stdout.on("data", (d) => out.push(d));
+    p.on("error", () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+    p.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return resolve(null);
+      const moved = new Set();
+      let final = 0;
+      let boundary = false;
+      for (const line of Buffer.concat(out).toString("utf8").split("\n")) {
+        const h = /^[0-9a-f]{40} \d+ (\d+)/.exec(line);
+        if (h) {
+          final = Number(h[1]);
+          boundary = false;
+        } else if (line === "boundary") {
+          boundary = true;
+        } else if (line.startsWith("\t") && boundary) {
+          moved.add(final);
+        }
+      }
+      resolve(moved);
+    });
+  });
+}
+
+async function detectMovedLines(target, scope, files, review, timeoutMs) {
+  const moved = new Map();
+  if (review.move_detection === false || scope.staged || !scope.fromRef || scope.fromRef === "HEAD") {
+    return { moved, files: 0, lines: 0 };
+  }
+  const min = positiveInt(review.move_detection_min_lines, 20);
+  const todo = files.filter((f) => {
+    const e = scope.lines.get(keyOf(f));
+    return e && e !== ALL_LINES && e.size >= min && !GENERATED_RE.test(f);
+  });
+  let lines = 0;
+  let next = 0;
+  const worker = async () => {
+    while (next < todo.length) {
+      const rel = todo[next++];
+      const set = await blameMoved(target, rel, scope.fromRef, timeoutMs);
+      if (!set) continue;
+      const changed = scope.lines.get(keyOf(rel));
+      const hit = new Set([...set].filter((n) => changed.has(n)));
+      if (hit.size) {
+        moved.set(keyOf(rel), hit);
+        lines += hit.size;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, todo.length) }, worker));
+  return { moved, files: todo.length, lines };
 }
 
 function fmtFinding(f) {
@@ -1931,6 +2019,9 @@ function printConsole(meta, checks, reviews) {
       P(`  ${C.dim}        backend ${fr.backend} · ${fr.model}${fr.effort ? ` · effort ${fr.effort}` : ""}` +
         (fr.cache && fr.cache.enabled ? ` · cache ${fr.cache.hits} hit(s) / ${fr.cache.reviewed} reviewed` : "") +
         (fr.batch_id ? ` · batch ${fr.batch_id}` : "") + `${C.end}`);
+      if (fr.preexisting && fr.preexisting.length) {
+        P(`  ${C.dim}        ${fr.preexisting.length} pre-existing finding(s) in moved/untouched code (listed, not gating)${C.end}`);
+      }
       if (fr.advisory.length) {
         P(`  ${C.dim}        ${fr.advisory.length} advisory finding(s) from low-precision rules (not posted, not gating)${C.end}`);
       }
@@ -1975,6 +2066,10 @@ function buildMarkdown(meta, checks, reviews) {
   }
   if (meta.gate) {
     lines.push(`- **Gate:** fail on \`${meta.gate.fail_on}\` — ${meta.gate.failed ? "**FAILED**" : "passed"}`);
+  }
+  if (meta.moved_code && meta.moved_code.lines) {
+    lines.push(`- **Moved code:** ${meta.moved_code.lines} changed line(s) in ${meta.moved_code.files_with_moves} ` +
+      "file(s) were copied unchanged from the base (git blame -C) and are treated as pre-existing");
   }
   lines.push("");
   lines.push("## Summary");
@@ -2041,6 +2136,19 @@ function buildMarkdown(meta, checks, reviews) {
       lines.push(`- **Budget:** ~${fr.budget.estimated_input_tokens} of ${fr.budget.max_input_tokens} input tokens` +
         (fr.budget.skipped_functions ? `; ${fr.budget.skipped_functions} lower-risk function(s) skipped` : ""));
     }
+    if (fr.moved_functions) {
+      lines.push(`- **Moved code:** ${fr.moved_functions} reviewed function(s) consist only of code moved unchanged ` +
+        "from the base; findings there are listed as pre-existing");
+    }
+    if (fr.context_files) {
+      lines.push(`- **Project context sent:** ${fr.context_files.length ? fr.context_files.map((c) =>
+        `\`${c.file}\`${c.truncated ? " (truncated)" : ""}`).join(", ") : "none found (review.context_files)"}` +
+        (fr.context_titles_only ? `; ${fr.context_titles_only} less relevant doc(s) listed by title only` : ""));
+    }
+    if (fr.schema_columns) {
+      lines.push(`- **Schema facts:** allowed values of ${fr.schema_columns} enum/CHECK column(s) from SQL migrations, ` +
+        "attached to packets that use them");
+    }
     if (fr.impacted_files.length) {
       lines.push(`- **Impacted files outside the diff** (callers of changed functions): ` +
         fr.impacted_files.slice(0, 40).map((f) => `\`${f}\``).join(", ") +
@@ -2057,7 +2165,7 @@ function buildMarkdown(meta, checks, reviews) {
       lines.push("**Evidence (verified against the file):**");
       for (const e of f.evidence) lines.push(`- \`${e.file}${e.line ? ":" + e.line : ""}\` — \`${String(e.quote).replace(/`/g, "'")}\``);
       lines.push("");
-      lines.push(`**Fix:** ${f.fix}`);
+      lines.push(`**Suggested fix** _(not verified by the tool — check it against the code and schema)_: ${f.fix}`);
       lines.push("");
     };
     if (fr.posted.length) {
@@ -2071,6 +2179,14 @@ function buildMarkdown(meta, checks, reviews) {
     if (fr.minor.length) {
       lines.push(`<details><summary>Minor findings (${fr.minor.length})</summary>`, "");
       fr.minor.forEach(renderF);
+      lines.push("</details>", "");
+    }
+    if (fr.preexisting && fr.preexisting.length) {
+      lines.push(`<details><summary>Pre-existing — in code this change only moved or didn't touch ` +
+        `(${fr.preexisting.length})</summary>`, "",
+        "_Real candidates, but not introduced by this change: every quoted line is code that was moved " +
+        "unchanged from the base or isn't part of the diff. Track them separately; they don't count toward the gate._", "");
+      fr.preexisting.forEach(renderF);
       lines.push("</details>", "");
     }
     if (fr.advisory.length) {
@@ -2554,7 +2670,9 @@ function loadConfig(target, scannerDir, explicit) {
 
 const REVIEW_DEFAULTS = {
   mode: "functions", model: null, rules: { enable: [], disable: [], custom: [] },
-  context_files: ["CLAUDE.md", "AGENTS.md"], context_chars: 12000, skip_paths: [],
+  context_files: ["CLAUDE.md", "AGENTS.md"], context_chars: 60000, context_file_chars: 24000,
+  context_doc_chars: 6000, context_doc_summary_chars: 700, skip_paths: [],
+  move_detection: true, move_detection_min_lines: 20, moved_code: "classify", schema_facts: true,
   max_functions: 80, max_callers: 8, max_callees: 20, max_body_lines: 200,
   caller_context_lines: 4, min_severity: "medium", timeout_sec: 600,
   // Phase 3 - cost
@@ -2642,17 +2760,264 @@ function groupLineRanges(nums) {
   return out;
 }
 
-function projectContext(target, review) {
-  const parts = [];
-  let budget = positiveInt(review.context_chars, 12000);
-  for (const rel of review.context_files || []) {
-    const text = readText(path.join(target, rel), 1000000);
-    if (!text || budget <= 0) continue;
-    const t = text.length > budget ? text.slice(0, budget) + "\n[... truncated ...]" : text;
-    budget -= t.length;
-    parts.push(`--- ${rel} ---\n${t.trim()}`);
+// Words worth matching between code and docs: identifiers split on camelCase
+// and snake_case, lower-cased, 4+ letters, minus filler.
+const CTX_STOP = new Set(("this that with from have will when then than they them their there these those " +
+  "what which while where would could should must also into only over under about after before each such " +
+  "true false null undefined return const await async function export import default string number boolean " +
+  "void type interface value data error result message status users user page file files code using used use " +
+  "make made need needs some more most other same very just like").split(" "));
+
+function ctxTerms(text) {
+  const out = new Map();
+  const words = String(text).replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z]+/);
+  for (const w of words) if (w.length >= 4 && !CTX_STOP.has(w)) out.set(w, (out.get(w) || 0) + 1);
+  return out;
+}
+
+/**
+ * Project context for the reviewer.
+ * - review.context_files entries WITHOUT wildcards (CLAUDE.md, AGENTS.md) are
+ *   always sent, each capped at review.context_file_chars.
+ * - Glob entries (docs/adr/*.md) are a library: each doc is scored by the
+ *   distinctive terms it shares with the code under review (tf-idf style) and
+ *   the most relevant go in until review.context_chars is used; the rest are
+ *   listed by title only so the reviewer knows they exist.
+ */
+function projectContext(target, review, allFiles, codeHint = "") {
+  const budgetTotal = positiveInt(review.context_chars, 40000);
+  const perFile = positiveInt(review.context_file_chars, 12000);
+  const pinned = [];
+  const library = [];
+  const seen = new Set();
+  for (const entry of review.context_files || []) {
+    const glob = /[*?[]/.test(String(entry));
+    const rels = glob
+      ? allFiles.filter((f) => globMatcher([String(entry)])(f)).sort()
+      : [String(entry)];
+    for (const rel of rels) {
+      if (seen.has(keyOf(rel))) continue;
+      seen.add(keyOf(rel));
+      const text = readText(path.join(target, rel), 1000000);
+      if (!text || !text.trim()) continue;
+      (glob ? library : pinned).push({ rel, text });
+    }
   }
-  return parts.join("\n\n");
+
+  const parts = [];
+  const used = [];
+  let budget = budgetTotal;
+  const take = (doc, cap, score) => {
+    if (budget <= 300) return false;
+    const limit = Math.min(cap, budget);
+    const truncated = doc.text.length > limit;
+    const t = truncated ? doc.text.slice(0, limit) + "\n[... truncated ...]" : doc.text;
+    budget -= t.length;
+    parts.push(`--- ${doc.rel} ---\n${t.trim()}`);
+    used.push({ file: doc.rel, chars: t.length, truncated, ...(score != null ? { relevance: Math.round(score * 10) / 10 } : {}) });
+    return true;
+  };
+  for (const doc of pinned) take(doc, perFile, null);
+
+  const omitted = [];
+  if (library.length) {
+    // BM25 over the docs (length-normalised, so long docs don't win by size),
+    // with a boost for words in the doc's file name / title.
+    const code = ctxTerms(codeHint);
+    const docTerms = library.map((d) => ctxTerms(d.text));
+    const titleTerms = library.map((d) =>
+      ctxTerms(`${path.basename(d.rel).replace(/[-_.]/g, " ")} ${(d.text.split(/\r?\n/).find((l) => l.trim()) || "")}`));
+    const lens = docTerms.map((t) => [...t.values()].reduce((a, b) => a + b, 0) || 1);
+    const avg = lens.reduce((a, b) => a + b, 0) / lens.length;
+    const df = new Map();
+    for (const t of docTerms) for (const w of t.keys()) df.set(w, (df.get(w) || 0) + 1);
+    const N = library.length;
+    const k1 = 1.2;
+    const b = 0.75;
+    const scored = library.map((d, i) => {
+      let s = 0;
+      for (const [w, n] of docTerms[i]) {
+        if (!code.has(w)) continue;
+        const idf = Math.log(1 + (N - df.get(w) + 0.5) / (df.get(w) + 0.5));
+        const tf = (n * (k1 + 1)) / (n + k1 * (1 - b + (b * lens[i]) / avg));
+        s += idf * tf * Math.log(1 + code.get(w));
+      }
+      for (const w of titleTerms[i].keys()) {
+        if (!code.has(w)) continue;
+        const idf = Math.log(1 + (N - (df.get(w) || 0) + 0.5) / ((df.get(w) || 0) + 0.5));
+        s += 2 * idf * Math.log(1 + code.get(w));
+      }
+      return { d, s };
+    }).sort((x, y) => y.s - x.s);
+    // 1) Every doc's DECISION in brief - the authoritative part (ADRs:
+    //    "## Decision"; otherwise the first paragraph). Small and complete, so
+    //    no decision is missed because of ranking.
+    const briefChars = positiveInt(review.context_doc_summary_chars, 700);
+    const briefs = [];
+    for (const d of library) {
+      const lines = d.text.split(/\r?\n/);
+      const title = (lines.find((l) => l.trim()) || d.rel).replace(/^#+\s*/, "").trim();
+      const status = (/^\*{0,2}status:?\*{0,2}:?\s*(.+)$/im.exec(d.text) || [])[1];
+      const di = lines.findIndex((l) => /^#{1,4}\s*decision\b/i.test(l.trim()));
+      let body;
+      if (di >= 0) {
+        // Up to the next heading of the same or a higher level (keep sub-points).
+        const level = (/^(#+)/.exec(lines[di].trim()) || ["", "##"])[1].length;
+        const end = lines.findIndex((l, i) => i > di && /^#+\s/.test(l.trim()) &&
+          (/^(#+)/.exec(l.trim())[1].length <= level));
+        body = lines.slice(di + 1, end > di ? end : undefined).join("\n");
+      } else {
+        body = lines.slice(lines.findIndex((l) => l.trim()) + 1).join("\n");
+      }
+      body = body.replace(/\n{2,}/g, "\n").trim();
+      if (body.length > briefChars) body = body.slice(0, briefChars) + " …";
+      briefs.push(`## ${title}${status ? ` [${status.replace(/\*/g, "").trim()}]` : ""} (${d.rel})\n${body}`);
+    }
+    const briefText = briefs.join("\n\n");
+    if (briefText.length < budget) {
+      parts.push(`--- project decisions in brief (${library.length} docs; the Decision section of each) ---\n${briefText}`);
+      budget -= briefText.length;
+      used.push({ file: `${library.length} decision summaries`, chars: briefText.length, truncated: false });
+    }
+    // 2) Remaining budget: full text of the docs most related to this code.
+    const minScore = scored.length ? scored[0].s * 0.15 : 0;
+    const perDoc = positiveInt(review.context_doc_chars, 6000);
+    for (const { d, s } of scored) {
+      if (s <= 0 || s < minScore || budget < 1500 || !take(d, perDoc, s)) omitted.push(d);
+    }
+  }
+  return { text: parts.join("\n\n"), files: used, omitted: omitted.map((d) => d.rel) };
+}
+
+// --------------------------------------------------------------------------- //
+//  Schema facts: allowed values of enum / CHECK-constrained columns, parsed
+//  from SQL migrations. Attached to review packets that use those columns so
+//  the reviewer (and its suggested fixes) work from the real schema.
+// --------------------------------------------------------------------------- //
+function sqlValues(s) {
+  return [...String(s).matchAll(/'((?:[^']|'')*)'/g)].map((m) => m[1].replace(/''/g, "'"));
+}
+
+function splitTopLevel(s) {
+  const out = [];
+  let depth = 0;
+  let inStr = false;
+  let cur = "";
+  for (const ch of s) {
+    if (ch === "'") inStr = !inStr;
+    if (!inStr) {
+      if (ch === "(") depth++;
+      else if (ch === ")") depth--;
+      else if (ch === "," && depth === 0) {
+        out.push(cur.trim());
+        cur = "";
+        continue;
+      }
+    }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+// "status in ('a','b')" / "(status)::text = any (array['a'::text, ...])"
+function parseCheck(expr) {
+  const e = unquoteIdents(expr);
+  let m = /\(?\s*(\w+)\s*\)?(?:::[\w ]+?)?\s+in\s*\(([^)]*)\)/i.exec(e);
+  if (!m) m = /\(?\s*(\w+)\s*\)?(?:::[\w ]+?)?\s*=\s*any\s*\(\s*\(?\s*array\s*\[([^\]]*)\]/i.exec(e);
+  if (!m) return null;
+  const values = sqlValues(m[2]);
+  return values.length ? { col: m[1].toLowerCase(), values } : null;
+}
+
+// Archived / backup migration folders describe an old schema; never use them.
+const STALE_SQL_RE = /(^|\/)[^/]*(archive|backup|deprecated|legacy|_old|\.old)[^/]*\//i;
+
+function buildSchemaIndex(target, allFiles, review = {}) {
+  const exclude = globMatcher(review.schema_exclude);
+  const sqlFiles = allFiles
+    .filter((f) => endsWithExt(f, SUPA_SQL_EXT) && !STALE_SQL_RE.test(f) && !exclude(f))
+    .sort().slice(0, 4000);
+  const enums = new Map(); // enum name -> values
+  const cols = new Map(); // "table.col" -> { table, col, values?, enumName?, source }
+  const setCol = (table, col, data) => {
+    const k = `${shortTable(table)}.${col.toLowerCase()}`;
+    cols.set(k, { table: shortTable(table), col: col.toLowerCase(), ...(cols.get(k) || {}), ...data });
+  };
+  const colDef = (table, def, source) => {
+    const cm = /^"?(\w+)"?\s+([\w."]+)/.exec(def);
+    if (!cm || /^(constraint|check|primary|unique|foreign|exclude)$/i.test(cm[1])) {
+      const ck = /check\s*\((.*)\)/is.exec(def);
+      const c = ck && parseCheck(ck[1]);
+      if (c) setCol(table, c.col, { values: c.values, enumName: null, source });
+      return;
+    }
+    const type = shortTable(cm[2].replace(/"/g, "")).toLowerCase();
+    if (enums.has(type)) setCol(table, cm[1], { enumName: type, values: null, source });
+    const ck = /check\s*\((.*)\)/is.exec(def);
+    const c = ck && parseCheck(ck[1]);
+    if (c) setCol(table, c.col || cm[1], { values: c.values, enumName: null, source });
+  };
+  for (const rel of sqlFiles) {
+    const text = readText(path.join(target, rel), 3000000);
+    if (!text) continue;
+    for (const st of splitSqlStatements(stripSqlComments(text))) {
+      const s = st.norm;
+      let m;
+      if ((m = /^create type ([\w."]+) as enum \((.*)\)$/i.exec(s))) {
+        enums.set(shortTable(m[1].replace(/"/g, "")).toLowerCase(), sqlValues(m[2]));
+      } else if ((m = /^alter type ([\w."]+) add value (?:if not exists )?'((?:[^']|'')*)'/i.exec(s))) {
+        const k = shortTable(m[1].replace(/"/g, "")).toLowerCase();
+        enums.set(k, [...(enums.get(k) || []), m[2].replace(/''/g, "'")]);
+      } else if ((m = /^create (?:(?:global|local) )?(?:unlogged )?table (?:if not exists )?([\w."]+) \((.*)\)/is.exec(s))) {
+        const table = m[1].replace(/"/g, "");
+        for (const def of splitTopLevel(m[2])) colDef(table, def, rel);
+      } else if ((m = /^alter table (?:if exists )?(?:only )?([\w."]+) (.*)$/is.exec(s))) {
+        const table = m[1].replace(/"/g, "");
+        for (const action of splitTopLevel(m[2])) {
+          let a;
+          if ((a = /^add column (?:if not exists )?(.*)$/is.exec(action))) colDef(table, a[1], rel);
+          else if ((a = /^add constraint \S+ check \((.*)\)/is.exec(action))) {
+            const c = parseCheck(a[1]);
+            if (c) setCol(table, c.col, { values: c.values, enumName: null, source: rel });
+          } else if ((a = /^alter column "?(\w+)"? (?:set data )?type ([\w."]+)/i.exec(action))) {
+            const type = shortTable(a[2].replace(/"/g, "")).toLowerCase();
+            setCol(table, a[1], enums.has(type) ? { enumName: type, values: null, source: rel } : { enumName: null, values: null });
+          }
+        }
+      }
+    }
+  }
+  // column name -> [{ table, col, values, source }]
+  const byCol = new Map();
+  for (const c of cols.values()) {
+    const values = c.enumName ? enums.get(c.enumName) : c.values;
+    if (!values || !values.length) continue;
+    if (!byCol.has(c.col)) byCol.set(c.col, []);
+    byCol.get(c.col).push({ table: c.table, col: c.col, values, source: c.source, enumName: c.enumName || null });
+  }
+  return byCol;
+}
+
+// Facts for the columns a packet visibly compares to string literals.
+function schemaFactsFor(p, schema, max = 8) {
+  if (!schema || !schema.size) return [];
+  const code = [p.body, ...p.callers.map((c) => c.snippet)].join("\n");
+  if (!/['"`]/.test(code)) return [];
+  const facts = [];
+  for (const [col, defs] of schema) {
+    if (col.length < 3) continue;
+    const re = new RegExp(`(['"\`.]${col}['"\`]?\\b|\\b${col}\\s*(?:===?|!==?|:|\\)|,))`, "i");
+    if (!re.test(code)) continue;
+    // Prefer the tables this code names (.from('leads'), 'leads'); otherwise all.
+    const named = defs.filter((d) => new RegExp(`['"\`]${d.table}['"\`]`, "i").test(code));
+    for (const d of named.length ? named : defs) {
+      facts.push(`${d.table}.${d.col} allowed values: ${d.values.slice(0, 40).join(" | ")}` +
+        `${d.enumName ? ` (enum ${d.enumName})` : " (CHECK constraint)"}`);
+    }
+    if (facts.length >= max) break;
+  }
+  return facts.slice(0, max);
 }
 
 // Run lib/impact.js in a child process with its own heap.
@@ -2693,8 +3058,19 @@ function collectImpact(scannerDir, target, scope, files, ctx, review) {
 }
 
 function packetText(p, n, inDiff) {
-  const L = [`### PACKET ${n}: ${p.file} :: ${p.name}  [${p.kind}, ${p.status}${p.exported ? ", exported" : ""}]`];
-  L.push(`changed lines: ${compressRanges(p.changedLines)}`);
+  const status = p.allMoved ? "moved unchanged from the base" : p.status;
+  const L = [`### PACKET ${n}: ${p.file} :: ${p.name}  [${p.kind}, ${status}${p.exported ? ", exported" : ""}]`];
+  const moved = p.movedLines || [];
+  const fresh = p.changedLines.filter((x) => !moved.includes(x));
+  if (moved.length) {
+    L.push(`new or edited lines: ${fresh.length ? compressRanges(fresh) : "none"}`);
+    L.push(`moved unchanged from the base (pre-existing code): ${compressRanges(moved)}`);
+  } else {
+    L.push(`changed lines: ${compressRanges(p.changedLines)}`);
+  }
+  if (p.schemaFacts && p.schemaFacts.length) {
+    L.push("SCHEMA FACTS (from SQL migrations; authoritative):", ...p.schemaFacts.map((f) => `- ${f}`));
+  }
   L.push(p.excerpt ? "NEW CODE (excerpt around the changes):" : "NEW CODE:", "```", p.body, "```");
   if (p.oldBody) L.push("OLD CODE (before this change; not quotable as evidence):", "```", p.oldBody, "```");
   if (p.callees.length) {
@@ -2727,10 +3103,12 @@ function verifyFindings(raw, chunkPackets, rulesById, target) {
     ranges.get(k).push([a, b]);
   };
   const signatures = [];
+  const facts = [];
   for (const p of chunkPackets) {
     addRange(p.file, p.start, p.end);
     for (const c of p.callers) addRange(c.file, c.start, c.end);
     for (const c of p.callees) signatures.push(sigKey(`${c.name}${c.signature}`));
+    for (const f of p.schemaFacts || []) facts.push(normWs(f));
   }
   const inReviewed = (file, line) => (ranges.get(keyOf(file)) || []).some(([a, b]) => line >= a - 2 && line <= b + 2);
   const cache = new Map();
@@ -2769,6 +3147,8 @@ function verifyFindings(raw, chunkPackets, rulesById, target) {
         evidence.push({ file: efile, line: at, quote: e.quote });
       } else if (sigKey(e.quote).length > 6 && signatures.some((s) => s.includes(sigKey(e.quote)))) {
         evidence.push({ file: "(resolved signature)", line: 0, quote: e.quote });
+      } else if (normWs(e.quote).length > 6 && facts.some((f) => f.includes(normWs(e.quote).replace(/^- /, "")))) {
+        evidence.push({ file: "(schema fact)", line: 0, quote: e.quote });
       } else {
         bad = `quote not found at ${efile}:${e.line}: "${String(e.quote).slice(0, 80)}"`;
         break;
@@ -2881,7 +3261,24 @@ async function functionReview(scannerDir, target, scope, files, ctx, review, opt
     .map((p, i) => ({ p, i, s: riskScore(p, inDiff) }))
     .sort((a, b) => b.s - a.s || a.i - b.i)
     .map((x) => x.p);
+  // Moved code + schema facts on each packet.
+  const schema = review.schema_facts === false ? null : buildSchemaIndex(target, ctx.allFiles, review);
+  for (const p of packets) {
+    const moved = (scope.moved && scope.moved.get(keyOf(p.file))) || null;
+    p.movedLines = moved ? p.changedLines.filter((n) => moved.has(n)) : [];
+    p.allMoved = p.changedLines.length > 0 && p.movedLines.length === p.changedLines.length;
+    p.schemaFacts = schemaFactsFor(p, schema);
+  }
+  result.schema_columns = schema ? schema.size : 0;
+  if (review.moved_code === "skip") {
+    const before = packets.length;
+    for (let i = packets.length - 1; i >= 0; i--) if (packets[i].allMoved) packets.splice(i, 1);
+    if (before > packets.length) {
+      result.notes.push(`${before - packets.length} function(s) consisting only of moved code were not reviewed (review.moved_code: skip)`);
+    }
+  }
   result.functions = packets.length;
+  result.moved_functions = packets.filter((p) => p.allMoved).length;
   result.packets_meta = packets.map((p) => ({ file: p.file, name: p.name, callerFiles: p.callerFiles || [] }));
   if (!packets.length) return { ...result, skip: result.notes[0] || "no changed functions to review" };
 
@@ -2893,7 +3290,13 @@ async function functionReview(scannerDir, target, scope, files, ctx, review, opt
   result.rules_version = version;
   const rulesById = new Map(rules.map((r) => [r.id, r]));
   const instructions = readText(path.join(scannerDir, ".quality", "prompts", "functions.md")) || "";
-  const projCtx = projectContext(target, review);
+  // Relevance is judged against all packets of the run, so the prefix stays
+  // identical across this run's calls (prompt cache).
+  const codeHint = packets.map((p) => `${p.file} ${p.name} ${p.body}`).join("\n");
+  const context = projectContext(target, review, ctx.allFiles, codeHint);
+  const projCtx = context.text;
+  result.context_files = context.files;
+  result.context_titles_only = context.omitted.length;
   const facts = (impact.compiler || []).map((c) =>
     `- ${c.config}: strictNullChecks ${c.strictNullChecks ? "ON" : "OFF"}${c.checkJs ? ", checkJs ON" : ""}`);
   // Stable prefix first (identical for every call and run -> prompt-cached);
@@ -3065,9 +3468,16 @@ async function functionReview(scannerDir, target, scope, files, ctx, review, opt
   const min = SEV_RANK[review.min_severity] || SEV_RANK.medium;
   result.findings.sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity] ||
     (a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line));
+  result.preexisting = [];
   for (const f of result.findings) {
     f.fingerprint = fingerprintOf(target, `ai/${f.rule}`, f.file, f.line);
-    if (demoted.has(f.rule)) result.advisory.push(f);
+    // New only if the finding or its evidence touches a line this change added
+    // or edited. Findings resting entirely on moved or untouched code are real
+    // but pre-existing: reported separately, never posted or gating.
+    f.origin = isFreshLine(scope, f.file, f.line) ||
+      f.evidence.some((e) => e.line && isFreshLine(scope, e.file, e.line)) ? "new" : "pre-existing";
+    if (scope.filter && f.origin === "pre-existing") result.preexisting.push(f);
+    else if (demoted.has(f.rule)) result.advisory.push(f);
     else if (SEV_RANK[f.severity] >= min) result.posted.push(f);
     else result.minor.push(f);
   }
@@ -3181,6 +3591,7 @@ Read-only quality scanner. Never modifies your code.
   --no-cache           don't reuse cached per-function reviews
   --cache-dir DIR      review cache folder (default ~/.cache/marketink-quality-gate)
   --rule-stats FILE    rule precision from lib/feedback.js (demotes weak rules)
+  --no-move-detection  treat moved/extracted code as new (skip git blame -C)
   --sarif FILE         also write a SARIF 2.1.0 file (GitHub code scanning)
   --no-report          print only; write no files
   --out DIR            report output dir (default: ./quality-reports)
@@ -3222,6 +3633,7 @@ async function main(argv) {
         "no-cache": { type: "boolean", default: false },
         "cache-dir": { type: "string" },
         "rule-stats": { type: "string" },
+        "no-move-detection": { type: "boolean", default: false },
         config: { type: "string" },
         "fail-on": { type: "string" },
         sarif: { type: "string" },
@@ -3414,7 +3826,17 @@ async function main(argv) {
   let checks;
   let reviews = [];
   let aiResult = null;
+  let moveInfo = null;
   try {
+    // Moved/extracted code is pre-existing, even though git shows it as added.
+    if (!scopeAll && !args["no-move-detection"]) {
+      moveInfo = await detectMovedLines(target, scope, files, review, 180000);
+      scope.moved = moveInfo.moved;
+      if (moveInfo.lines) {
+        process.stdout.write(`${C.dim}move detection: ${moveInfo.lines} changed line(s) in ${moveInfo.moved.size} ` +
+          `file(s) are code moved unchanged from ${base || "the base"} - treated as pre-existing.${C.end}\n`);
+      }
+    }
     checks = args["ai-only"] ? [] : runChecks(target, files, scope, disabled, ctx);
 
     let useDiffMode = aiMode === "diff";
@@ -3502,6 +3924,7 @@ async function main(argv) {
     time: stampHuman(now),
     version: VERSION,
     config_sources: configSources,
+    moved_code: moveInfo ? { files_checked: moveInfo.files, files_with_moves: moveInfo.moved.size, lines: moveInfo.lines } : null,
     ai_mode: args["no-ai"] ? "off" : aiResult ? "functions" : "diff",
     ai_review: aiResult ? (({ packets_meta: _omit, ...rest }) => rest)(aiResult) : null,
     ai_usage: reviews.some((r) => r.called) ? usageTotals(reviews) : null,

@@ -26,8 +26,15 @@
     "mode": "functions",
     "model": null,
     "rules": { "enable": [], "disable": [], "custom": [] },
-    "context_files": ["CLAUDE.md", "AGENTS.md"],
-    "context_chars": 12000,
+    "context_files": ["CLAUDE.md", "AGENTS.md", "docs/adr/*.md", "docs/decisions/*.md"],
+    "context_chars": 60000,
+    "context_file_chars": 24000,
+    "context_doc_chars": 6000,
+    "context_doc_summary_chars": 700,
+    "move_detection": true,
+    "move_detection_min_lines": 20,
+    "moved_code": "classify",
+    "schema_facts": true,
     "skip_paths": [
       "**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/__mocks__/**",
       "e2e/**", "**/*.stories.*", "**/*.d.ts"
