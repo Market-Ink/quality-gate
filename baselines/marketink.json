@@ -62,5 +62,15 @@
     "rule_stats": null,
     "precision": { "min_samples": 10, "demote_below": 0.5, "promote_above": 0.85 },
     "impact_for_types": true
+  },
+
+  "security_audit": {
+    "_comment": "Manual whole-repo audit (scan.js --security-audit, README §21). Flags override these.",
+    "profile": "standard",
+    "budget": null,
+    "max_usd": null,
+    "model": null,
+    "timeout_min": 240,
+    "fail_on": "none"
   }
 }

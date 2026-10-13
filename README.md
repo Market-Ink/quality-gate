@@ -54,6 +54,7 @@ edits code, never changes git state, never installs anything into your project.
 18. [Versioning, migration & roadmap](#18-versioning-migration--roadmap)
 19. [Cost controls: backends, cache, budgets, batches](#19-cost-controls-backends-cache-budgets-batches)
 20. [Trust: inline feedback, rule precision, auto-demotion](#20-trust-inline-feedback-rule-precision-auto-demotion)
+21. [Security audit (manual, whole repo)](#21-security-audit-manual-whole-repo)
 
 ---
 
@@ -81,7 +82,8 @@ matches a rule in the [catalog](#8-rule-catalog), with quoted proof.
   `messages.create` with no tools defined. Through the CLI, `claude -p` runs
   with `--tools "" --restricted --strict-mcp-config` in an empty temp folder.
   Either way it can't read, write or run anything; it only sees the packets the
-  tool built.
+  tool built. (The whole-repo security audit needs an agent with tools, so it
+  is a separate tool, `audit.js` (§21), that `scan.js` never calls.)
 - ✅ **Writes nothing outside the reports and caches.** Besides the reports, the
   only writes are the review cache (`~/.cache/marketink-quality-gate`) and, in
   CI, the Actions caches. None of them are in the repo.
@@ -901,6 +903,10 @@ qg --base origin/master --group <id> --ai-only   # one feature
 qg --base origin/master --plan-batches 10 --final-state
 qg --base origin/master --only src/billing
 
+# security audit: separate tool, audit.js (manual, whole repo, §21)
+qg-audit --path ../repo --profile quick --budget 15 --max-usd 10
+qg-audit --path ../repo --base v1.4.0                 # changes since the last release
+
 # CI (per project)
 .github/workflows/quality-gate.yml   -> uses: sarthakkk1212/quality-gate/.github/workflows/quality-gate.yml@v2
 .quality-gate.json                   -> { "extends": "marketink", ... }
@@ -1070,6 +1076,121 @@ recovers on its own if later feedback improves.
 GITHUB_TOKEN=... GITHUB_REPOSITORY=org/repo node lib/feedback.js --days 90 --out rule-stats.json
 qg --rule-stats rule-stats.json
 ```
+
+---
+
+## 21. Security audit (manual, whole repo)
+
+`audit.js` runs a **whole-repo security audit** using
+[cloudflare/security-audit-skill](https://github.com/cloudflare/security-audit-skill).
+A pinned, unmodified copy lives in `vendor/security-audit/` (MIT; see
+`VENDOR.md`).
+
+**It's a separate tool, not a `scan.js` mode.** `scan.js` promises that the
+AI gets no tools (§1), and an audit can't work that way. Keeping it in its
+own entry point means that promise has no exceptions: no flag or config can
+make `scan.js` hand the AI tools. Both tools share this repo, the
+`.quality-gate.json` file (`security_audit` block) and the release tags.
+`audit.js` never runs from the hooks or the PR workflow. You start it by hand,
+and a release or schedule trigger can call the same command later.
+
+**One-word command** (next to `qg`, §4):
+```powershell
+function qg-audit { node E:\MarketInk\Quality_Gate\quality-gate\audit.js @args }   # Windows $PROFILE
+```
+```bash
+qg-audit() { node /path/to/quality-gate/audit.js "$@"; }                          # macOS / Linux
+```
+Wrappers also ship: `audit.ps1` and `./audit`.
+
+| | PR AI review (§7) | Security audit |
+|---|---|---|
+| Question | Did this change break something? | Where is this system exploitable? |
+| Scope | Changed functions + callers | Whole repo (or `--only` paths / changes since `--base`) |
+| How | One tool-less call per batch, quotes verified by the tool | Claude Code orchestrates recon → hunters → independent verifiers → report |
+| Cost / time | Cents, minutes | Dollars to tens of dollars, 30 min to hours |
+
+### Run it
+
+```bash
+qg-audit --path ../some-repo                                    # standard profile
+qg-audit --path ../some-repo --profile quick --budget 15 --max-usd 10
+qg-audit --path ../some-repo --only src/api                     # one area
+qg-audit --path ../some-repo --base v1.4.0                      # only what changed since the last release
+qg-audit --path ../some-repo --fail-on high                     # exit 1 on a confirmed high/critical
+qg-audit --help
+```
+
+Needs the `claude` CLI on `PATH`. Locally it uses your Claude login, and the
+run counts against plan limits. With `ANTHROPIC_API_KEY` set, it bills the API.
+
+| Flag | Config (`security_audit.*`) | Default | Meaning |
+|---|---|---|---|
+| `--profile` | `profile` | `standard` | `quick` (one hunter wave, coarse units) / `standard` / `deep` (finer units, critic waves until clean) |
+| `--budget` | `budget` | none | Max agent invocations. The skill reserves critics and verifiers first, and refuses to start if the budget can't fund a minimal pass |
+| `--max-usd` | `max_usd` | none | Hard spend cap (`claude --max-budget-usd`); the CLI stops at the cap |
+| `--model` | `model` | CLI default | E.g. `sonnet` for cheaper runs |
+| `--timeout` | `timeout_min` | `240` | Minutes before the audit is stopped |
+| `--fail-on` | `fail_on` | `none` | `informational` … `critical`: exit 1 on a confirmed finding at that severity or above. **Note:** findings are only `confirmed` after a sandboxed local check, and this tool runs no target code, so today real issues land in `needs_validation` and this gate won't trip |
+| `--only`, `--base`, `--out`, `--config` | — | — | Path scope (repeatable) · changes since a ref · output root (default `./quality-reports`) · project config |
+
+### What you get
+
+Each run writes to `<out>/security-audit/<repo>/run-N/`. `<out>` defaults to
+`./quality-reports`. If that folder is inside the scanned repo and git doesn't
+ignore it, runs go to `~/marketink-security-audit/<repo>/` instead.
+
+| File | Contents |
+|---|---|
+| `SUMMARY.md` (also `../latest.md`) | Quality Gate's summary: status, validator results, findings by severity, time, cost |
+| `REPORT.md` | The skill's report: overview, coverage statement, findings |
+| `FINDINGS-DETAIL.md` / `NEEDS-VALIDATION.md` | Full write-ups; leads blocked on a fact the source can't show |
+| `findings.json` | `confirmed` (with severity, trace, fix) / `needs_validation` (no severity) / `rejected` |
+| `coverage-ledger.json`, `architecture.md` | What was and wasn't covered; the system map |
+| `claude-stream.jsonl` | The raw agent transcript, for debugging |
+
+**Runs build on each other.** A new run reads the earlier `run-*` folders'
+ledgers and findings, then goes after the gaps and re-checks changed code. Keep
+the folder between runs. The skill's authors report a single run finds roughly
+half of what repeated runs find.
+
+After the agent finishes, **Quality Gate re-runs both validators**
+(`validate-findings.cjs`, `validate-coverage-ledger.cjs`). A run counts as
+valid only if both pass.
+
+Both the agent and the gate call the validators through
+`lib/audit-validate.cjs`. On Linux and macOS it runs the upstream validators
+unchanged. Upstream refuses every input on Windows, because Windows has no
+`O_NOFOLLOW` (a symlink-race guard). There, the runner reads the file with an
+equivalent check: not a link, a regular file, exactly one hard link, under
+5 MB, and the same file identity after opening. It then calls the same upstream
+`validateDocument`.
+
+**Exit codes:** `0` = valid result, gate not hit · `1` = `--fail-on`
+hit (with `--fail-on` set, an **incomplete** run also fails: unaudited isn't
+clean), **or** no valid result (timed out, crashed, validators failed) · `2` = bad
+input.
+
+### Safety: this tool gives the agent tools
+
+Unlike `scan.js` (§1), the audit agent has tools, so it's locked down. It runs
+`claude -p --restricted --permission-mode dontAsk --strict-mcp-config`:
+- **Read / Grep / Glob / sub-agents** only inside the target, the vendored
+  skill and the audit folder.
+- **Write / Edit only inside the run's own folder.** Writes into the target are
+  denied.
+- **Bash only for the validator runner** (`node lib/audit-validate.cjs …`),
+  plus Claude Code's built-in read-only commands such as `ls`. Running target code, `node -e`, network access (`curl`) and MCP
+  servers are all denied.
+- **No sandbox is assumed.** The skill is told not to build, test or run target
+  code, so leads that would need execution stay `needs_validation`.
+- **The target's contents are untrusted.** The prompt says to treat them as
+  data, never as instructions.
+
+### Updating the skill
+
+See `vendor/security-audit/VENDOR.md`. Update by PR and tag a release, like the
+rule catalog.
 
 ---
 

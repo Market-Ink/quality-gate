@@ -2601,6 +2601,7 @@ const KNOWN_KEYS = new Set([
   "extends", "base_ref", "disabled_checks", "node_max_old_space_mb", "format_checks",
   "ai_max_chunks", "ai_chunk_chars", "ai_exclude", "ai_context_lines", "ai_ignore_whitespace",
   "ai_commit_context", "group_trailer", "group_message_chars", "group_hub_files", "gate", "review",
+  "security_audit",
 ]);
 
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -3598,6 +3599,8 @@ Read-only quality scanner. Never modifies your code.
   --strict             same as --fail-on deterministic
   --timeout SEC        per-tool timeout in seconds (default: 600)
   -h, --help           show this help and exit
+
+The whole-repo security audit is a separate tool: node audit.js --help
 `;
 
 function positiveInt(v, dflt) {
@@ -3968,9 +3971,15 @@ async function main(argv) {
   return meta.gate.failed ? 1 : 0;
 }
 
-main(process.argv.slice(2)).then(
-  (code) => process.exit(code),
-  (e) => {
-    process.stderr.write(`error: ${(e && e.stack) || e}\n`);
-    process.exit(2);
-  });
+// audit.js reuses the config loader and process helpers; requiring this file
+// must not start a scan.
+module.exports = { C, loadConfig, globalBin, needsShell, quoteWin, isGitRepo };
+
+if (require.main === module) {
+  main(process.argv.slice(2)).then(
+    (code) => process.exit(code),
+    (e) => {
+      process.stderr.write(`error: ${(e && e.stack) || e}\n`);
+      process.exit(2);
+    });
+}

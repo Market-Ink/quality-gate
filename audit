@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Thin wrapper so you can type `./audit` instead of `node audit.js`.
+# Passes every argument straight through. Whole-repo security audit — see audit.js.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! command -v node >/dev/null 2>&1; then
+  echo "error: Node.js not found on PATH. Install Node 18+ (20+ recommended): https://nodejs.org" >&2
+  exit 2
+fi
+exec node "$DIR/audit.js" "$@"
